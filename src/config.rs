@@ -991,9 +991,9 @@ pub struct SpendConfig {
     /// faucet-funded testnet wallet, high-frequency low-value sends) should lower this to
     /// roughly its own typical payment size.
     pub min_split_output_value: u64,
-    /// How long, in seconds, the wallet actor spends finishing sends it has already accepted
-    /// when shutdown is signalled, before dropping whatever is left (see
-    /// `actor::WalletActor::finish_accepted_sends`). Default 60.
+    /// Seconds after the actor observes shutdown during which it may start an accepted send
+    /// or wait for a proof. An inline payout or a proof commit already executing can finish
+    /// after this deadline. Default 60.
     ///
     /// This has to fit **inside** whatever grace period the supervisor allows between its
     /// stop signal and `SIGKILL`, and the common ones are shorter than this default: `docker

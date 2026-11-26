@@ -2,7 +2,7 @@
 //! family. Response shapes follow `rpc/blockchain.rs`; heights are the wallet's
 //! fully-scanned view (`blocks` = accurate-balances height, `headers` = known tip).
 
-use serde_json::json;
+use serde_json::{json, Value};
 
 use super::{Client, ClientError};
 
@@ -146,6 +146,73 @@ impl Client<'_> {
     pub async fn get_block_header(&self, blockhash: &str) -> Result<BlockHeader, ClientError> {
         self.call_typed("getblockheader", vec![json!(blockhash)])
             .await
+    }
+
+    /// `getblocktemplate ( template_request )`: forwarded to the node; the node's answer is
+    /// returned unchanged. The node calls below work the same way, and answer `-32601` on a
+    /// lightwalletd backend, which has no node RPC to forward to.
+    pub async fn get_block_template(
+        &self,
+        template_request: Option<Value>,
+    ) -> Result<Value, ClientError> {
+        let params = Self::positional(vec![template_request]);
+        self.call_typed("getblocktemplate", params).await
+    }
+
+    /// `submitblock <hexdata>`: forwarded to the node (`null` on acceptance, or the node's
+    /// rejection reason such as `"duplicate"`).
+    pub async fn submit_block(&self, hexdata: &str) -> Result<Value, ClientError> {
+        self.call_typed("submitblock", vec![json!(hexdata)]).await
+    }
+
+    /// `getblock <hash|height> ( verbosity )`: forwarded to the node.
+    pub async fn get_block(
+        &self,
+        hash_or_height: &str,
+        verbosity: Option<u8>,
+    ) -> Result<Value, ClientError> {
+        let params = Self::positional(vec![
+            Some(json!(hash_or_height)),
+            verbosity.map(|v| json!(v)),
+        ]);
+        self.call_typed("getblock", params).await
+    }
+
+    /// `getblocksubsidy ( height )`: forwarded to the node.
+    pub async fn get_block_subsidy(&self, height: Option<u32>) -> Result<Value, ClientError> {
+        let params = Self::positional(vec![height.map(|h| json!(h))]);
+        self.call_typed("getblocksubsidy", params).await
+    }
+
+    /// `getmininginfo`: node mining statistics, including difficulty when the node provides it
+    /// through this call or `getdifficulty`.
+    pub async fn get_mining_info(&self) -> Result<Value, ClientError> {
+        self.call_typed("getmininginfo", vec![]).await
+    }
+
+    /// `getdifficulty`: forwarded to the node.
+    pub async fn get_difficulty(&self) -> Result<Value, ClientError> {
+        self.call_typed("getdifficulty", vec![]).await
+    }
+
+    /// `getnetworkhashps ( blocks height )`: forwarded to the node.
+    pub async fn get_network_hash_ps(
+        &self,
+        blocks: Option<i64>,
+        height: Option<i64>,
+    ) -> Result<Value, ClientError> {
+        let params = Self::positional(vec![blocks.map(|b| json!(b)), height.map(|h| json!(h))]);
+        self.call_typed("getnetworkhashps", params).await
+    }
+
+    /// `getnetworksolps ( blocks height )`: forwarded to the node.
+    pub async fn get_network_sol_ps(
+        &self,
+        blocks: Option<i64>,
+        height: Option<i64>,
+    ) -> Result<Value, ClientError> {
+        let params = Self::positional(vec![blocks.map(|b| json!(b)), height.map(|h| json!(h))]);
+        self.call_typed("getnetworksolps", params).await
     }
 
     /// `waitfornewblock ( timeout_ms )`: block until the best *scanned* block changes.

@@ -618,6 +618,36 @@ impl ChainSource for AnySource {
     }
 }
 
+/// Why a node JSON-RPC call forwarded verbatim ([`AnySource::passthrough`]) did not return a
+/// result.
+#[derive(Debug)]
+pub enum PassthroughError {
+    /// The node examined the request and refused it. The code and message are the node's own,
+    /// so a caller probing a method (Miningcore's `submitblock` with no params) sees exactly
+    /// what the node said.
+    Rpc { code: i64, message: String },
+    /// The backend has no node JSON-RPC to forward to (lightwalletd).
+    Unsupported,
+    /// The call never got an answer. The error names the node's address, so it is for the
+    /// server log only.
+    Transport(anyhow::Error),
+}
+
+impl AnySource {
+    /// Forward one JSON-RPC call to the node unchanged: `params` go out as given and the node's
+    /// `result` comes back as given.
+    pub async fn passthrough(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, PassthroughError> {
+        match self {
+            AnySource::Zebra(s) => s.passthrough(method, params).await,
+            AnySource::Lwd(_) => Err(PassthroughError::Unsupported),
+        }
+    }
+}
+
 /// An in-order stream of compact blocks for one requested range.
 #[allow(clippy::large_enum_variant)] // single-instance enum; see AnySource
 pub enum CompactBlockStream {

@@ -1932,6 +1932,11 @@ fn orphaned_receipt_reads_and_expires() {
                 want(txid),
                 "tip {tip} gettransaction: expired_unmined of {txid}"
             );
+            assert_eq!(
+                rec.detached_coinbase,
+                txid == &orphan,
+                "only the reward with a cleared block position is a detached coinbase"
+            );
         }
     };
 
@@ -2221,6 +2226,83 @@ fn a_rescan_written_address_row_still_answers_for_the_address_the_wallet_issued(
         .is_empty(),
         "a foreign address must still select no rows"
     );
+}
+
+#[test]
+fn list_unspent_excludes_only_the_detached_coinbase_at_zero_expiry() {
+    let net = network::regtest();
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = open::init_dbs(net, dir.path()).unwrap();
+    db.create_account("primary", &test_seed(), &genesis_birthday(), None)
+        .unwrap();
+    db.update_chain_tip(BlockHeight::from_u32(200)).unwrap();
+    drop(db);
+
+    let conn = rusqlite::Connection::open(open::data_db_path(dir.path())).unwrap();
+    // Recreate a wallet from before zecd recorded coinbase positions during a rewind.
+    conn.execute_batch(
+        "DROP TRIGGER zecd_remember_detached_reward;
+         DROP TABLE zecd_detached_rewards;",
+    )
+    .unwrap();
+    // Each v4 transaction has a transparent and a Sapling output. Only the reward
+    // has a null prevout. Neither expires, so expiry alone cannot distinguish them.
+    for (id, prev_hash) in [(1, [0u8; 32]), (2, [1u8; 32])] {
+        let mut raw = 0x8000_0004u32.to_le_bytes().to_vec();
+        raw.extend(0x892f_2085u32.to_le_bytes()); // Sapling version group
+        raw.push(1); // one transparent input
+        raw.extend(prev_hash);
+        raw.extend([0xff; 4]); // prevout index
+        raw.extend([2, 1, 1]); // height in the coinbase script
+        raw.extend([0xff; 4]); // sequence
+        raw.push(1); // one transparent output
+        raw.extend(100u64.to_le_bytes());
+        raw.extend([0; 9]); // empty output script, locktime and expiry height zero
+        raw.extend((-500i64).to_le_bytes()); // value entering Sapling
+        raw.extend([0, 1]); // no Sapling spends, one output
+        raw.extend([0; 948]); // serialized Sapling output; this read does not verify proofs
+        raw.push(0); // no JoinSplits
+        raw.extend([0; 64]); // binding signature
+        let tx = zcash_primitives::transaction::Transaction::read(
+            raw.as_slice(),
+            zcash_protocol::consensus::BranchId::Sapling,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO transactions (id_tx, txid, raw, expiry_height, min_observed_height, mined_height, tx_index)
+                      VALUES (?1, ?2, ?3, 0, 100, 100, ?1 - 1)",
+            rusqlite::params![id, tx.txid().as_ref().as_slice(), raw],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO transparent_received_outputs
+                     (transaction_id, output_index, account_id, address, script, value_zat, address_id)
+                     SELECT ?1, 0, account_id, 'tmtest', X'00', 100, id FROM addresses LIMIT 1", [id]).unwrap();
+        conn.execute(
+            "INSERT INTO sapling_received_notes
+                 (transaction_id, output_index, account_id, diversifier, value, rcm, is_change, address_id)
+             SELECT ?1, 0, account_id, X'00', 500, X'00', 0, id FROM addresses LIMIT 1",
+            [id],
+        ).unwrap();
+    }
+    conn.execute(
+        "UPDATE transactions SET mined_height = NULL, tx_index = NULL",
+        [],
+    )
+    .unwrap();
+    drop(open::init_dbs(net, dir.path()).unwrap()); // upgrade after the rewind
+    let notes = read::list_unspent(net, dir.path(), read::AccountScope::Any).unwrap();
+    assert_eq!(notes.len(), 2);
+    let ordinary: Vec<u8> = conn
+        .query_row("SELECT txid FROM transactions WHERE id_tx = 2", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let ordinary = hex::encode(ordinary.into_iter().rev().collect::<Vec<_>>());
+    assert!(notes
+        .iter()
+        .all(|n| n.txid == ordinary && n.mined_height.is_none()));
+    assert!(notes.iter().any(|n| n.pool == 0));
+    assert!(notes.iter().any(|n| n.pool == 2));
 }
 
 fn populate_two_transactions(conn: &rusqlite::Connection, account_id: i64, address_id: i64) {

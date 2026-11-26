@@ -44,6 +44,10 @@ pub struct AppState {
     /// configured, which is every pre-fleet deployment - the management RPCs then say so rather
     /// than pretending to work.
     pub fleet: Option<Arc<crate::fleet::FleetManager>>,
+    /// The upstream connection on the daemon's global `[backend]`, which the node methods zecd
+    /// forwards (`getblocktemplate`, `submitblock`, ...) are sent over. `None` only where no
+    /// node was configured (in-process tests); those methods then answer as unsupported.
+    pub node_hub: Option<Arc<crate::chain::hub::ChainHub>>,
 }
 
 impl AppState {

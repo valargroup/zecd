@@ -689,12 +689,13 @@ async fn regtest_shielded_coinbase_receive_and_spend() {
     let mut cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
     cfg.restore_mnemonic = Some(COINBASE_MNEMONIC.to_string());
     cfg.birthday = Some(birthday);
+    cfg.fetch_memos = Some(false);
     // Light mode on the zecd-lwd leg: the shielded coinbase outputs then arrive as compact-block
     // actions from lightwalletd rather than from a converted full block.
     let _zecd_lwd = attach_backend(&mut cfg, zebrad.rpc_port)
         .await
         .expect("attach the selected backend");
-    let zecd = Zecd::start(&cfg).await.expect("start zecd");
+    let mut zecd = Zecd::start(&cfg).await.expect("start zecd");
 
     // 4. A few more shielded coinbases, then a confirmations tail - which also pays zecd. The
     //    ZIP-315 untrusted-note policy needs 10
@@ -754,6 +755,35 @@ async fn regtest_shielded_coinbase_receive_and_spend() {
             zecd_regtest_harness::NU6_3_ACTIVATION_HEIGHT
         );
     }
+    let reward = &entries[0];
+    assert!(reward["confirmations"].as_u64().unwrap() < 100);
+    let tx = zecd
+        .call("gettransaction", json!([reward["txid"]]))
+        .await
+        .unwrap();
+    assert_eq!(tx["generated"], true);
+    assert!(
+        tx["details"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["category"] == "generate"),
+        "{tx}"
+    );
+    let history = zecd
+        .call("listtransactions", json!(["*", 100]))
+        .await
+        .unwrap();
+    assert!(
+        history
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["txid"] == reward["txid"]
+                && e["category"] == "generate"
+                && e["generated"] == true),
+        "{history}"
+    );
     let coinbase_total: f64 = entries
         .iter()
         .map(|e| e["amount"].as_f64().expect("amount"))
@@ -852,6 +882,65 @@ async fn regtest_shielded_coinbase_receive_and_spend() {
         tx["confirmations"].as_i64().unwrap_or(0) > 0,
         "the shielded-coinbase spend confirmed: {tx}"
     );
+
+    // Mine and scan recent checkpoints so the wallet can rewind a single block.
+    for _ in 0..4 {
+        zebrad.generate_blocks(1).await.unwrap();
+        sync_to_tip(&zecd, &zebrad).await;
+    }
+    let old_hash = zebrad.rpc("getbestblockhash", json!([])).await.unwrap();
+    let block = zebrad.rpc("getblock", json!([old_hash, 1])).await.unwrap();
+    let reward_txid = block["tx"][0].as_str().expect("coinbase txid");
+    zebrad
+        .rpc("invalidateblock", json!([old_hash]))
+        .await
+        .expect("detach the shielded reward");
+    zebrad
+        .generate_blocks(4)
+        .await
+        .expect("mine the replacement chain");
+    zecd.wait_until_synced_to_node(&zebrad, SYNC_TIMEOUT)
+        .await
+        .unwrap();
+    for restart in [false, true] {
+        if restart {
+            zecd.restart(&cfg).await.unwrap();
+            zecd.wait_until_synced_to_node(&zebrad, SYNC_TIMEOUT)
+                .await
+                .unwrap();
+        }
+        let tx = zecd
+            .call("gettransaction", json!([reward_txid]))
+            .await
+            .unwrap();
+        assert_eq!(tx["generated"], true, "{tx}");
+        assert_eq!(tx["details"][0]["category"], "orphan", "{tx}");
+        assert_eq!(tx["details"][0]["diversifier_index"], 0, "{tx}");
+        let history = zecd
+            .call("listtransactions", json!(["*", 100]))
+            .await
+            .unwrap();
+        assert!(
+            history
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["txid"] == reward_txid
+                    && e["category"] == "orphan"
+                    && e["generated"] == true
+                    && e["diversifier_index"] == 0),
+            "{history}"
+        );
+        let unspent = zecd.call("listunspent", json!([0])).await.unwrap();
+        assert!(
+            !unspent
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["txid"] == reward_txid),
+            "detached reward {reward_txid} must be absent from unspent outputs"
+        );
+    }
 
     println!(
         "shielded-coinbase e2e OK: {} Orchard coinbase notes ({coinbase_total} ZEC) received \

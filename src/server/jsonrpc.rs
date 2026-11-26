@@ -23,7 +23,7 @@ pub struct RpcRequest {
 impl RpcRequest {
     /// Validate a raw JSON value into an `RpcRequest`. The `id` (possibly null) is returned
     /// in the `Err` case too so the caller can build a correctly-addressed error response.
-    pub fn from_value(v: Value) -> Result<RpcRequest, (Value, RpcError)> {
+    pub fn from_value(mut v: Value) -> Result<RpcRequest, (Value, RpcError)> {
         let id = v.get("id").cloned().unwrap_or(Value::Null);
 
         let method = match v.get("method").and_then(|m| m.as_str()) {
@@ -39,11 +39,11 @@ impl RpcRequest {
             }
         };
 
-        let params_raw = v.get("params").cloned().unwrap_or(Value::Null);
-        let params = match &params_raw {
+        let params_raw = v.get_mut("params").map(Value::take).unwrap_or(Value::Null);
+        let params = match params_raw {
             Value::Null => Vec::new(),
-            Value::Array(arr) => arr.clone(),
-            // Object params: keep raw; positional accessors will see an empty vec.
+            Value::Array(arr) => arr,
+            // The HTTP dispatcher keeps named arguments separately for node calls.
             Value::Object(_) => Vec::new(),
             other => {
                 return Err((
@@ -91,18 +91,41 @@ impl RpcRequest {
     }
 }
 
-/// Build a success response envelope.
-pub fn success(id: Value, result: Value) -> Value {
-    json!({ "result": result, "error": Value::Null, "id": id })
+/// Field order is part of the HTTP compatibility contract: s-nomp measures the
+/// decimal precision of a balance by reading from `result` to the next comma.
+#[derive(serde::Serialize)]
+pub(crate) struct Reply {
+    result: Value,
+    error: Value,
+    id: Value,
 }
 
-/// Build an error response envelope.
+impl Reply {
+    pub(crate) fn success(id: Value, result: Value) -> Self {
+        Self {
+            result,
+            error: Value::Null,
+            id,
+        }
+    }
+
+    pub(crate) fn error(id: Value, err: &RpcError) -> Self {
+        Self {
+            result: Value::Null,
+            error: json!({ "code": err.code, "message": err.message }),
+            id,
+        }
+    }
+}
+
+/// Build a success response envelope as a JSON value.
+pub fn success(id: Value, result: Value) -> Value {
+    json!(Reply::success(id, result))
+}
+
+/// Build an error response envelope as a JSON value.
 pub fn error(id: Value, err: &RpcError) -> Value {
-    json!({
-        "result": Value::Null,
-        "error": { "code": err.code, "message": err.message },
-        "id": id,
-    })
+    json!(Reply::error(id, err))
 }
 
 /// The parsed top-level request body: a single call or a batch.

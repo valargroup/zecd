@@ -14,6 +14,8 @@ use crate::amount::Amount;
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct ValidateAddress {
     pub isvalid: bool,
+    /// Ownership in the routed wallet, when a valid address and wallet were available.
+    pub ismine: Option<bool>,
     /// Present only when valid.
     pub address: Option<String>,
     /// Real script for transparent addresses; empty for shielded (present only when valid).

@@ -236,13 +236,12 @@ async fn start_mineable_zebrad(
 
 /// Mine `count` blocks, asserting they were actually produced.
 fn mine(rpc_port: u16, count: u32) {
-    let mined =
-        zebra_rpc(rpc_port, "generate", &format!("[{count}]")).expect("mine the requested blocks");
-    assert_eq!(
-        mined.as_array().map(|a| a.len()),
-        Some(count as usize),
-        "{mined}"
-    );
+    // Each shielded coinbase requires a proof. Bound the work per RPC so a batch
+    // on a shared runner cannot exhaust the socket read timeout.
+    for _ in 0..count {
+        let mined = zebra_rpc(rpc_port, "generate", "[1]").expect("mine one block");
+        assert_eq!(mined.as_array().map(Vec::len), Some(1), "{mined}");
+    }
 }
 
 /// The env gate both tests share. `None` means skip.

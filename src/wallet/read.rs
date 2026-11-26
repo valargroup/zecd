@@ -1,7 +1,7 @@
 //! Read-only wallet queries served from short-lived connections, so they never block on the
 //! sync writer (SQLite WAL gives consistent snapshots).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::anyhow;
@@ -471,6 +471,8 @@ pub struct TxRecord {
     pub expired_unmined: bool,
     /// Position of the transaction within its block, when known (`blockindex`).
     pub tx_index: Option<u32>,
+    /// A detached reward identified by its former block position or its stored inputs.
+    pub(crate) detached_coinbase: bool,
     /// Display-hex hash of the mining block, when scanned (`blockhash`).
     pub block_hash: Option<String>,
     /// Unix time the wallet created the transaction (librustzcash sets `created` only for
@@ -789,6 +791,17 @@ macro_rules! expired_unmined_sql {
 /// The `expired_unmined_sql!` expression, for statements assembled at run time.
 const EXPIRED_UNMINED_SQL: &str = expired_unmined_sql!();
 
+/// Both history queries use the position recorded at rewind. Older wallets can also
+/// identify a detached coinbase from its raw transaction when that payload was stored.
+macro_rules! detached_reward_columns {
+    () => {
+        "CASE WHEN t.mined_height IS NULL THEN EXISTS (
+             SELECT 1 FROM zecd_detached_rewards r WHERE r.txid = t.txid
+         ) ELSE 0 END AS known_reward,
+         CASE WHEN t.mined_height IS NULL AND t.tx_index IS NULL THEN t.raw END AS unmined_raw"
+    };
+}
+
 /// The column list shared by [`list_transactions`] and [`get_transaction`]: `v_transactions`
 /// joined with the mining block's hash and the raw `transactions` row's `created` timestamp
 /// (set only for wallet-authored sends; stored as `yyyy-MM-dd HH:mm:ss.fffffffzzz`, which
@@ -798,7 +811,9 @@ const TX_COLS: &str = concat!(
             v.fee_paid, v.block_time,
             ",
     expired_unmined_sql!(),
-    " AS expired_unmined, v.tx_index,
+    " AS expired_unmined, v.tx_index, ",
+    detached_reward_columns!(),
+    ",
             b.hash AS block_hash,
             t.id_tx AS id_tx,
             CAST(strftime('%s', t.created) AS INTEGER) AS created_time"
@@ -828,6 +843,7 @@ fn tx_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(Option<i64>, TxReco
             block_time: row.get("block_time")?,
             expired_unmined: row.get("expired_unmined")?,
             tx_index: row.get("tx_index")?,
+            detached_coinbase: is_detached_reward(row)?,
             block_hash: row
                 .get::<_, Option<Vec<u8>>>("block_hash")?
                 .map(|h| txid_display(&h)),
@@ -836,6 +852,29 @@ fn tx_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(Option<i64>, TxReco
             raw: None,
         },
     ))
+}
+
+/// A rewind recorded locally or a retained raw coinbase can identify an orphaned reward.
+fn is_detached_reward(row: &rusqlite::Row<'_>) -> rusqlite::Result<bool> {
+    Ok(row.get::<_, bool>("known_reward")? || raw_is_coinbase(row.get_ref("unmined_raw")?))
+}
+
+/// After a rewind clears the block index, the null transparent prevout identifies a coinbase.
+fn raw_is_coinbase(raw: rusqlite::types::ValueRef<'_>) -> bool {
+    match raw {
+        rusqlite::types::ValueRef::Blob(bytes) => {
+            // The branch argument supplies pre-v5 signature context and has no
+            // effect on decoding a transparent input. Later formats encode their branch.
+            zcash_primitives::transaction::Transaction::read(
+                bytes,
+                zcash_protocol::consensus::BranchId::Sapling,
+            )
+            .ok()
+            .and_then(|tx| tx.transparent_bundle().map(|bundle| bundle.is_coinbase()))
+            .unwrap_or(false)
+        }
+        _ => false,
+    }
 }
 
 /// One transaction's row, built from base tables instead of `v_transactions`.
@@ -909,7 +948,9 @@ SELECT t.mined_height AS mined_height,
        t.txid AS txid,
        t.expiry_height AS expiry_height,
        t.fee AS fee_paid,
-       t.tx_index AS tx_index,
+       t.tx_index AS tx_index, ",
+    detached_reward_columns!(),
+    ",
        b.time AS block_time,
        b.hash AS block_hash,
        CAST(strftime('%s', t.created) AS INTEGER) AS created_time,
@@ -1160,6 +1201,7 @@ pub fn received_tx_records(
                 block_time: None,
                 expired_unmined,
                 tx_index,
+                detached_coinbase: false,
                 block_hash: None,
                 created_time: None,
                 outputs: Vec::new(),
@@ -1749,17 +1791,13 @@ pub fn list_unspent(
                )"
         );
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(named_params! { ":target_height": target }, |r| {
-            Ok((
-                r.get::<_, Vec<u8>>(0)?,
-                r.get::<_, u32>(1)?,
-                r.get::<_, i64>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, bool>(4)?,
-            ))
-        })?;
-        for row in rows {
-            let (txid, vout, value, address, generated) = row?;
+        let mut rows = stmt.query(named_params! { ":target_height": target })?;
+        while let Some(row) = rows.next()? {
+            let txid: Vec<u8> = row.get(0)?;
+            let vout = row.get(1)?;
+            let value: i64 = row.get(2)?;
+            let address = row.get(3)?;
+            let generated = row.get(4)?;
             let txid = txid_display(&txid);
             let (mined_height, trusted) = tx_meta.get(&txid).copied().unwrap_or((None, false));
             out.push(UnspentNote {
@@ -1773,6 +1811,23 @@ pub fn list_unspent(
                 generated,
             });
         }
+
+        // A wallet upgraded after a rewind may have only the raw coinbase to identify the
+        // orphan. Check this once per transaction across all pools, including selector results.
+        let columns = detached_reward_columns!();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT t.txid, {columns} FROM transactions t
+             WHERE t.mined_height IS NULL
+               AND (known_reward OR (unmined_raw IS NOT NULL AND ({unexpired_t})))"
+        ))?;
+        let mut rows = stmt.query(named_params! { ":target_height": target })?;
+        let mut detached = HashSet::new();
+        while let Some(row) = rows.next()? {
+            if is_detached_reward(row)? {
+                detached.insert(txid_display(row.get_ref(0)?.as_blob()?));
+            }
+        }
+        out.retain(|note| !detached.contains(&note.txid));
     }
     Ok(out)
 }
@@ -2276,7 +2331,8 @@ mod tests {
                  account_uuid BLOB
              );
              CREATE TABLE blocks (height INTEGER, hash BLOB);
-             CREATE TABLE transactions (id_tx INTEGER, txid BLOB, created TEXT,
+             CREATE TABLE zecd_detached_rewards(txid BLOB PRIMARY KEY);
+             CREATE TABLE transactions (id_tx INTEGER, txid BLOB, created TEXT, raw BLOB, tx_index INTEGER,
                  -- Read by the `expired_unmined` expression in TX_COLS.
                  mined_height INTEGER, expiry_height INTEGER, target_height INTEGER,
                  min_observed_height INTEGER);",

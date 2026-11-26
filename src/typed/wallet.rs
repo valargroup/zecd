@@ -623,6 +623,18 @@ impl Client<'_> {
         self.call_typed("getbalance", params).await
     }
 
+    /// `z_getbalance <address> ( minconf )`: zcashd's per-address balance. A transparent
+    /// address reports its own unspent outputs; a wallet-owned shielded or unified address
+    /// reports the wallet's spendable balance in the pools that address can receive into.
+    pub async fn z_get_balance(
+        &self,
+        address: &str,
+        minconf: Option<i64>,
+    ) -> Result<Amount, ClientError> {
+        let params = Self::positional(vec![Some(json!(address)), minconf.map(|m| json!(m))]);
+        self.call_typed("z_getbalance", params).await
+    }
+
     /// `getbalances`: the modern balance triple (+ zecd's `coinbase` subset).
     pub async fn get_balances(&self) -> Result<Balances, ClientError> {
         self.call_typed("getbalances", vec![]).await
@@ -871,7 +883,7 @@ impl Client<'_> {
             Some(json!(from_address)),
             Some(serde_json::to_value(recipients).expect("recipients serialize")),
             minconf.map(|m| json!(m)),
-            None, // fee: ZIP-317 only; an explicit fee is rejected on the wire
+            None, // fee: the ZIP-317 fee is always paid; an explicit fee is accepted and ignored
             privacy_policy.map(|p| json!(p)),
         ]);
         self.call_typed("z_sendmany", params).await
@@ -918,7 +930,7 @@ impl Client<'_> {
         let params = Self::positional(vec![
             Some(json!(from_addresses)),
             Some(json!(to_address)),
-            None, // fee: ZIP-317 only; an explicit fee is rejected on the wire
+            None, // fee: the ZIP-317 fee is always paid; an explicit fee is accepted and ignored
             transparent_limit.map(|l| json!(l)),
             shielded_limit.map(|l| json!(l)),
             memo.map(|m| json!(m)),

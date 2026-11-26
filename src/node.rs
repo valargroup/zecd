@@ -371,6 +371,7 @@ impl PreparedNode {
             active: crate::state::ActiveCommands::default(),
             operations: Arc::new(crate::operations::OperationRegistry::new()),
             fleet: fleet.clone(),
+            node_hub: Some(Arc::clone(&fleet_hub)),
             spend_limits,
         };
 
@@ -733,7 +734,7 @@ impl Node {
             method = %req.method,
             wallet = wallet.unwrap_or("default")
         );
-        crate::rpc::dispatch(&self.state, wallet, &req)
+        crate::rpc::dispatch(&self.state, wallet, &req, None)
             .instrument(span)
             .await
     }
@@ -890,6 +891,7 @@ pub(crate) mod testutil {
             active: crate::state::ActiveCommands::default(),
             operations: Arc::new(crate::operations::OperationRegistry::new()),
             fleet: None,
+            node_hub: None,
             spend_limits: crate::config::SpendLimits::new(&crate::config::SpendConfig::default()),
         })
     }

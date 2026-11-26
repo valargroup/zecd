@@ -5,6 +5,53 @@ All notable changes to zecd are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [Unreleased]
+
+### Added
+- **Mining RPC forwarding on a full-node backend.** On a zebra backend, `getblocktemplate`,
+  `submitblock`, `getblock`, `getblocksubsidy`, `getmininginfo`, `getdifficulty`,
+  `getnetworkhashps` and `getnetworksolps` are forwarded to the node. A node refusal
+  keeps the node's own code and message; an unreachable node is a generic `-1` with the details
+  in the log only; a lightwalletd backend answers `-32601`. `[rpc] allowed_methods` can leave
+  them out. `docs/OPERATIONS.md` has a "Mining pools" section for s-nomp and Miningcore.
+- **`z_getbalance <address> [minconf]`**, zcashd's per-address balance. A transparent address
+  reports its unspent outputs at that depth; one of the wallet's unified or Sapling addresses
+  reports the wallet's spendable balance in the pools that address can receive into (Orchard
+  and Ironwood for an Orchard receiver).
+- Pool RPC coverage includes block submission, funded payments, fee shortfalls and coinbase
+  history after a chain reorganization. See the client-specific limits in the operations guide.
+
+### Changed
+- Queued payouts and proof completions share one shutdown deadline, including proofs started
+  by a buffered payout while the wallet is stopping.
+- Wallet rewinds now remember which disconnected transactions were mined rewards, including
+  shielded receipts scanned with memo fetching disabled. Reward history preserves the
+  receiving address index across the rewind and restart.
+- Mining RPCs on a lightwalletd backend return method-not-found even while it is offline.
+- **Under `AllowFullyTransparent`, `sendmany` and `sendtoaddress` fall back to shielded notes.**
+  A send to transparent recipients that names no source still pays from the wallet's
+  transparent funds first; when they fall short it is now paid from shielded notes, with
+  shielded change, instead of failing with `-6` while `listunspent` reports enough funds.
+  A `sendmany` shortfall includes the lowercase `insufficient funds` message s-nomp checks
+  before retrying a payout with a fee allowance. When proving is pipelined, overlapping payouts
+  wait for the earlier spend to be recorded before selecting funds with their own privacy policy.
+- `listunspent` also excludes shielded rewards disconnected before a wallet upgrade when
+  the wallet retained the raw coinbase transaction.
+- **Forwarded `getmininginfo` includes `difficulty`.** The node's answer is returned as before,
+  plus the node's `getdifficulty` when the node leaves the field out, as Zebra and Zakura do.
+- **`gettransaction`, `listtransactions` and `listsinceblock` identify mined rewards.**
+  Transparent rewards report `immature` until the wallet scans 100 confirmations, then
+  `generate`. Shielded rewards report `generate` immediately. Both report `orphan` after
+  disconnection and carry `generated: true`. They previously reported `receive`.
+- **An explicit fee on `z_sendmany`, `z_shieldcoinbase` and `z_mergetoaddress` is accepted
+  instead of refused with `-8`.** The ZIP 317 fee is still what is paid, and the requested fee
+  is logged. A negative or non-numeric fee is refused (`-3`). `sendtoaddress`, `sendmany` and
+  `settxfee` keep refusing fee instructions.
+- `validateaddress` reports ownership for the selected wallet. HTTP balance responses place
+  the eight-decimal result first so s-nomp reads the correct number of zatoshis per ZEC.
+- The HTTP request limit is 4 MiB so a full-sized block fits in a submission batch. Forwarded
+  node calls accept named and positional parameters.
+
 ## [0.10.0] - 2026-11-24
 
 The 0.10.0 line, released as `0.10.0-rc1`. Everything below is relative to 0.9.0; the

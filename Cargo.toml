@@ -243,6 +243,7 @@ mimalloc-secure = ["mimalloc", "mimalloc/secure"]
 # release.
 
 [dev-dependencies]
+tokio = { version = "1.21", features = ["test-util"] }
 tempfile = "3"
 # Frontier bookkeeping for the fabricated-chain reorg test (matches librustzcash's version).
 incrementalmerkletree = "0.8"

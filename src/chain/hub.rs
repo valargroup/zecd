@@ -53,10 +53,10 @@ use zcash_client_backend::proto::service;
 use zcash_protocol::consensus::BlockHeight;
 use zcash_protocol::{ShieldedPool, TxId};
 
-use crate::backend::Server;
+use crate::backend::{Server, ServerKind};
 use crate::chain::{
     AbortOnDrop, AnySource, BroadcastOutcome, ChainSource, ChainTip, CompactBlockStream, FetchedTx,
-    MempoolStream, ServerInfo, SubtreeRootInfo, TxEvidence,
+    MempoolStream, PassthroughError, ServerInfo, SubtreeRootInfo, TxEvidence,
 };
 
 /// How long a fetched chain tip is served to other consumers before it is re-fetched. Sized well
@@ -198,6 +198,26 @@ impl ChainHub {
             generation,
             inner: source,
         })
+    }
+
+    /// Forward one node JSON-RPC call over the shared connection, for the RPC methods zecd
+    /// answers by asking the node (mining calls a pool sends its single daemon). A failure to
+    /// connect, or a call that got no answer, drops the connection for re-dial like any other
+    /// transport error; a refusal from the node leaves it alone.
+    pub async fn passthrough(
+        self: &Arc<Self>,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, PassthroughError> {
+        if self.server.kind() == ServerKind::Lightwalletd {
+            return Err(PassthroughError::Unsupported);
+        }
+        let source = self.acquire().await.map_err(PassthroughError::Transport)?;
+        let result = source.inner.passthrough(method, params).await;
+        if let Err(PassthroughError::Transport(_)) = &result {
+            source.failed().await;
+        }
+        result
     }
 
     /// Drop the shared connection if it is still the one `generation` names, so the next

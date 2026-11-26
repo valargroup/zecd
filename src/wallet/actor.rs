@@ -247,7 +247,7 @@ impl ProvingKeys {
 /// Cap on sends queued behind an in-flight proof (`[spend] pipeline_proving`). Each queued send
 /// is a blocked RPC handler, so the work-queue semaphore already bounds this; the cap is a
 /// defensive backstop so a misconfigured client can't grow the queue without limit. Past it,
-/// `begin_or_queue_send` sheds with `-4` back-pressure (the caller retries), like the async-op
+/// the queue sheds with `-4` back-pressure (the caller retries), like the async-op
 /// registry's inflight cap.
 const MAX_QUEUED_SENDS: usize = 64;
 
@@ -259,13 +259,66 @@ struct PendingSend {
     request: TransactionRequest,
     confirmations: Option<ConfirmationsPolicy>,
     privacy: SendPrivacy,
-    /// The funding source, carried so a send that waited in the queue selects its inputs from
-    /// the same pools it would have selected from had it started immediately. A queued send is
-    /// always shielded-sourced (`begin_or_queue_send` routes transparent ones inline), but
-    /// "shielded" is not one thing: `ANY_SAPLING` and `ANY_ORCHARD` each name one pool family,
-    /// and dropping that here would silently widen the selection back to every pool.
     source: SendSource,
     reply: oneshot::Sender<Result<TxId, RpcError>>,
+}
+
+/// All sends wait here in arrival order while a proof holds uncommitted inputs.
+#[derive(Default)]
+struct SendQueue {
+    pending: VecDeque<PendingSend>,
+    proof_in_flight: bool,
+}
+
+impl SendQueue {
+    fn push(&mut self, send: PendingSend) {
+        if self.pending.len() >= MAX_QUEUED_SENDS {
+            let _ = send.reply.send(Err(RpcError::wallet(format!(
+                "too many sends queued behind an in-flight proof ({MAX_QUEUED_SENDS}); retry shortly"
+            ))));
+        } else {
+            self.pending.push_back(send);
+        }
+    }
+
+    fn pop_ready(&mut self) -> Option<PendingSend> {
+        if self.proof_in_flight {
+            return None;
+        }
+        self.pending.pop_front()
+    }
+
+    /// Choose one unit of accepted work. Each completed step can start a proof or make a
+    /// queued payout spendable, so consult both queues again even after command ingress closes.
+    async fn next_shutdown_work(
+        &mut self,
+        commands: &mut mpsc::Receiver<WalletCommand>,
+        proofs: &mut mpsc::Receiver<SendCompletion>,
+        deadline: tokio::time::Instant,
+    ) -> Option<ShutdownWork> {
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        if self.proof_in_flight {
+            return tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(deadline) => None,
+                done = proofs.recv() => done
+                    .filter(|_| tokio::time::Instant::now() < deadline)
+                    .map(|done| ShutdownWork::Proof(Box::new(done))),
+            };
+        }
+        if let Some(send) = self.pop_ready() {
+            return Some(ShutdownWork::Payout(send));
+        }
+        commands.try_recv().ok().map(ShutdownWork::Command)
+    }
+}
+
+enum ShutdownWork {
+    Command(WalletCommand),
+    Payout(PendingSend),
+    Proof(Box<SendCompletion>),
 }
 
 /// A send whose prove+sign finished on a blocking thread, routed back to the actor so phase C
@@ -1180,11 +1233,7 @@ struct WalletActor {
     /// `[spend] shutdown_drain_secs`: how long to finish already-accepted sends once shutdown is
     /// signalled. See [`Self::finish_accepted_sends`].
     shutdown_drain: Duration,
-    /// Whether a pipelined send's proof is currently running on a blocking thread. While `true`,
-    /// new sends queue (in [`Self::send_queue`]) rather than starting - sends stay serialized.
-    send_in_flight: bool,
-    /// Sends deferred behind the in-flight proof, started in FIFO order as each one commits.
-    send_queue: VecDeque<PendingSend>,
+    send_queue: SendQueue,
     /// Loopback channel: the off-actor proof job posts its [`SendCompletion`] here, and the
     /// actor's command loop drains it to run phase C on the single writer.
     send_done_tx: mpsc::Sender<SendCompletion>,
@@ -1780,8 +1829,7 @@ async fn spawn_inner(
         shutdown_drain: cfg.shutdown_drain,
         trust_own_transactions: cfg.trust_own_transactions,
         max_send_catchup_blocks: cfg.max_send_catchup_blocks,
-        send_in_flight: false,
-        send_queue: VecDeque::new(),
+        send_queue: SendQueue::default(),
         send_done_tx,
         send_done_rx,
         seed,
@@ -2564,7 +2612,7 @@ impl WalletActor {
         self.update_status();
 
         let mut more_work = true;
-        loop {
+        'actor: loop {
             // Exit between sync batches once shutdown is signalled, so Ctrl-C/`stop` doesn't
             // wait out a long catch-up scan and the DB connection is dropped cleanly.
             if *self.shutdown.borrow() {
@@ -2576,6 +2624,10 @@ impl WalletActor {
             // iteration (between sync batches) so the seed doesn't linger long past expiry; the
             // `select!` branch below handles the idle case, and `do_send` has a hard backstop.
             self.relock_if_expired();
+            if let Some(send) = self.send_queue.pop_ready() {
+                self.start_send_caught(send).await;
+                continue;
+            }
             // An explicit `waitforsync` nudge counts as work to do, so the pass runs now rather
             // than after up to a full `sync_interval` of idling. Consumed here so one nudge
             // buys exactly one pass.
@@ -2593,12 +2645,18 @@ impl WalletActor {
             if more_work {
                 // Commit any pipelined send whose proof just finished, before the next sync
                 // batch - phase C is short (store + bounded broadcast) and the caller is waiting.
-                // `finish_send_caught` pumps the send queue, so a deferred send starts promptly.
-                while let Ok(done) = self.send_done_rx.try_recv() {
+                if let Ok(done) = self.send_done_rx.try_recv() {
                     self.finish_send_caught(done).await;
                 }
                 // Service any queued commands first so writers aren't starved by sync.
                 loop {
+                    if *self.shutdown.borrow() {
+                        continue 'actor;
+                    }
+                    if let Some(send) = self.send_queue.pop_ready() {
+                        self.start_send_caught(send).await;
+                        continue;
+                    }
                     match self.cmd_rx.try_recv() {
                         Ok(cmd) => {
                             if self.handle_command_caught(cmd).await {
@@ -3689,71 +3747,34 @@ impl WalletActor {
 
     /// Finish the sends this wallet already accepted, before the actor stops.
     ///
-    /// The HTTP layer starts refusing new requests the moment shutdown is triggered, so
-    /// whatever is queued here is exactly the set of sends a client was told would happen. The
-    /// actor used to exit at the top of its loop and drop them: their reply channels closed and
-    /// the operations failed with "actor stopped". Nothing had been stored or broadcast for
-    /// those, so no funds were at risk and no transaction was half-created - but the operator
-    /// lost the record of which in-flight sends happened, on exactly the restart boundary where
-    /// the in-memory operation registry already makes that hardest to reconstruct.
-    ///
-    /// So: commit a pipelined send whose proof is still running, then run the commands already
-    /// buffered on the channel. Both are bounded by `[spend] shutdown_drain_secs`, since a send
-    /// waiting on an upstream that is also going away must not hold the daemon open; anything
-    /// left when it expires is dropped exactly as before, with a warning naming what was lost.
-    /// New commands cannot arrive to extend this - `try_recv` takes only what is already
-    /// buffered - so this drains a set that can only shrink.
-    ///
-    /// The bound is configuration rather than a constant because the value that matters is not
-    /// how long a proof takes but how long the *supervisor* lets the process live after its
-    /// stop signal, and the common defaults straddle any number picked here (systemd 90s,
-    /// Kubernetes 30s, `docker stop` 10s). A drain longer than that is cut short by SIGKILL and
-    /// buys nothing. `0` skips the drain entirely.
+    /// Close ingress and use one deadline for buffered commands, queued sends and proofs,
+    /// including proofs started by those commands. Once an inline payout or a proof commit
+    /// starts, let its store and broadcast path finish before checking the deadline again.
     async fn finish_accepted_sends(&mut self) {
-        let drain = self.shutdown_drain;
-        if drain.is_zero() {
-            return;
-        }
-        let deadline = Instant::now() + drain;
-        let mut finished = 0usize;
-
-        // A pipelined send is mid-proof on a blocking thread; its completion is the only thing
-        // that stores and broadcasts it.
-        while self.send_in_flight && Instant::now() < deadline {
-            match tokio::time::timeout_at(deadline.into(), self.send_done_rx.recv()).await {
-                Ok(Some(done)) => {
-                    self.finish_send_caught(done).await;
-                    finished += 1;
-                }
-                // The sender is gone, or the deadline passed: nothing more will arrive.
-                Ok(None) | Err(_) => break,
-            }
-        }
-
-        while Instant::now() < deadline {
-            match self.cmd_rx.try_recv() {
-                Ok(cmd) => {
+        self.cmd_rx.close();
+        let deadline = tokio::time::sleep(self.shutdown_drain).deadline();
+        while let Some(work) = self
+            .send_queue
+            .next_shutdown_work(&mut self.cmd_rx, &mut self.send_done_rx, deadline)
+            .await
+        {
+            match work {
+                ShutdownWork::Command(cmd) => {
                     if self.handle_command_caught(cmd).await {
-                        return;
+                        break;
                     }
-                    finished += 1;
                 }
-                Err(_) => break,
+                ShutdownWork::Payout(send) => self.start_send_caught(send).await,
+                ShutdownWork::Proof(done) => self.finish_send_caught(*done).await,
             }
         }
-
-        if finished > 0 {
-            info!(
-                commands = finished,
-                "finished accepted work before shutting down"
-            );
-        }
-        let abandoned = self.send_queue.len() + usize::from(self.send_in_flight);
-        if abandoned > 0 {
+        let queued_commands = self.cmd_rx.len();
+        let queued_sends = self.send_queue.pending.len();
+        let proof_in_flight = self.send_queue.proof_in_flight;
+        if queued_commands > 0 || queued_sends > 0 || proof_in_flight {
             warn!(
-                abandoned,
-                "shutting down with sends still unfinished after \
-                 {drain:?}; they were never broadcast"
+                queued_commands,
+                queued_sends, proof_in_flight, "wallet shut down with unfinished work"
             );
         }
     }
@@ -5205,8 +5226,13 @@ impl WalletActor {
                 source,
                 reply,
             } => {
-                self.begin_or_queue_send(request, confirmations, privacy, source, reply)
-                    .await;
+                self.send_queue.push(PendingSend {
+                    request,
+                    confirmations,
+                    privacy,
+                    source,
+                    reply,
+                });
             }
             WalletCommand::GetRawTx { txid, reply } => {
                 let res = self.do_get_raw_tx(txid).await;
@@ -6019,7 +6045,7 @@ impl WalletActor {
     /// Build, prove, and broadcast a send inline (today's behaviour): the whole of phase A->C runs
     /// on the actor under `block_in_place`, so the actor (and thus sync) is blocked for the whole
     /// proof. `[spend] pipeline_proving` moves the proof off the actor - see
-    /// [`Self::begin_or_queue_send`]. Used directly when pipelining is disabled or ineligible.
+    /// [`Self::start_send`]. Used directly when pipelining is disabled or ineligible.
     async fn do_send(
         &mut self,
         request: TransactionRequest,
@@ -6079,13 +6105,33 @@ impl WalletActor {
                 // A t-address `fromaddress` narrows the t->t selection to that address's UTXOs
                 // (coin control); `ANY_TADDR` and the source-less Bitcoin-dialect sends spend
                 // across every receiver, the pre-`SendSource` behaviour.
-                let from = match source {
-                    SendSource::Transparent(from) => from,
-                    _ => None,
+                let (from, named_source) = match source {
+                    SendSource::Transparent(from) => (from, true),
+                    _ => (None, false),
                 };
-                return self
+                let result = self
                     .do_send_transparent(recipients, confirmations, usk, account_id, from)
                     .await;
+                // A send that names no source (`sendmany`, `sendtoaddress`) may be paid from
+                // either kind of funds, and `listunspent` lists both. So when the transparent
+                // UTXOs alone fall short, pay it from shielded notes (with shielded change)
+                // instead of failing while the wallet reports enough funds. s-nomp depends on
+                // this: its balance check sums `listunspent`, and its move of shielded funds to
+                // its payout t-address only sometimes succeeds. When the shielded notes fall
+                // short too, the transparent error is the one returned, since it says what the
+                // transparent funds lack (for example, that they are coinbase to be shielded).
+                if named_source || !is_insufficient_funds(&result) {
+                    return result;
+                }
+                info!("transparent funds fall short for a source-less send; paying from shielded notes");
+                let shielded =
+                    Box::pin(self.do_send(request, confirmations, privacy, SendSource::Shielded))
+                        .await;
+                return if is_insufficient_funds(&shielded) {
+                    result
+                } else {
+                    shielded
+                };
             }
         }
         // A per-call `minconf` (z_sendmany) overrides the wallet-wide policy for this send's
@@ -6279,31 +6325,18 @@ impl WalletActor {
         Ok(txid)
     }
 
-    /// Entry point for a `Send` command. Runs inline (today's behaviour) unless pipelining is
-    /// eligible, in which case the proof runs off the actor so sync stays live. Pipelined sends
-    /// stay serialized: only one PCZT is uncommitted at a time (no double-spend surface, no
-    /// reservation overlay), so a send arriving while a proof is in flight is queued and started
-    /// once the in-flight one commits.
-    async fn begin_or_queue_send(
-        &mut self,
-        request: TransactionRequest,
-        confirmations: Option<ConfirmationsPolicy>,
-        privacy: SendPrivacy,
-        source: SendSource,
-        reply: oneshot::Sender<Result<TxId, RpcError>>,
-    ) {
-        // `AllowFullyTransparent` sends are handled inline by `do_send` (they build via the
-        // transparent Builder, not the cached-Orchard PCZT prove path that pipelining accelerates),
-        // so never queue them for off-actor proving.
-        //
-        // A transparent *source* (`z_sendmany` from a t-address / `ANY_TADDR`) can't ride the
-        // pipeline either: the PCZT prove+sign step has no transparent signing pass, so `do_send`
-        // diverts transparent-funded proposals to the fused path, which signs transparent inputs
-        // itself. Routing here (before the queue) also keeps every queued send shielded-source.
-        //
-        // A Sapling-output send can't ride the pipeline either (it commits via the same PCZT
-        // extractor that has no Sapling verifying key). Route it through `do_send`, which diverts
-        // it to the fused path.
+    /// Choose how to build a send only after earlier sends have recorded their inputs.
+    async fn start_send(&mut self, send: PendingSend) {
+        let PendingSend {
+            request,
+            confirmations,
+            privacy,
+            source,
+            reply,
+        } = send;
+        // Fully transparent payments and transparent sources need the inline builder.
+        // Sapling outputs need its verifying key. Keep the caller's original funding policy
+        // on both paths, including the shielded fallback for a source-less payout.
         if privacy == SendPrivacy::AllowFullyTransparent
             || matches!(source, SendSource::Transparent(_))
             || !self.pipeline_eligible()
@@ -6313,31 +6346,14 @@ impl WalletActor {
             let _ = reply.send(res);
             return;
         }
-        if self.send_in_flight {
-            if self.send_queue.len() >= MAX_QUEUED_SENDS {
-                let _ = reply.send(Err(RpcError::wallet(format!(
-                    "too many sends queued behind an in-flight proof ({MAX_QUEUED_SENDS}); \
-                     retry shortly"
-                ))));
-                return;
-            }
-            self.send_queue.push_back(PendingSend {
-                request,
-                confirmations,
-                privacy,
-                source,
-                reply,
-            });
-            return;
-        }
         self.start_pipelined_send(request, confirmations, privacy, source, reply)
             .await;
     }
 
     /// Start a pipelined send: do phase A on the actor, then hand phase B (prove+sign) to a
     /// blocking thread and return to the loop. On a phase-A failure the caller is replied to here
-    /// and `send_in_flight` is left clear (the queue is pumped by the caller). On success
-    /// `send_in_flight` is set and the completion arrives later via `send_done_tx`.
+    /// and `proof_in_flight` is left clear (the queue is pumped by the caller). On success
+    /// `proof_in_flight` is set and the completion arrives later via `send_done_tx`.
     async fn start_pipelined_send(
         &mut self,
         request: TransactionRequest,
@@ -6353,7 +6369,7 @@ impl WalletActor {
         // rather than zecd's last-scanned height (which lags under load, producing an
         // already-expired -25). Mirrors the call in `do_send` for the non-pipelined path; a
         // no-op when the sync loop already has the wallet caught up. Runs here (not in
-        // `begin_or_queue_send`) so a send queued behind an in-flight proof re-syncs when it
+        // `start_send`) so a send queued behind an in-flight proof re-syncs when it
         // actually starts, keeping its tip fresh.
         if let Err(e) = self.sync_to_tip_for_send().await {
             let _ = reply.send(Err(e));
@@ -6399,7 +6415,7 @@ impl WalletActor {
             }
         };
         // As on the inline path, this awaits the background keygen only on a young daemon's
-        // first send. It happens before `send_in_flight` is set, so a keygen failure leaves the
+        // first send. It happens before `proof_in_flight` is set, so a keygen failure leaves the
         // pipeline free rather than wedged.
         let keys = match self
             .orchard_keys
@@ -6418,12 +6434,11 @@ impl WalletActor {
         // The prove runs off the actor task, so the wallet span does not follow it; carry it
         // into the closure so the panic/failure logs keep their wallet attribution.
         let span = tracing::Span::current();
-        self.send_in_flight = true;
         tokio::task::spawn_blocking(move || {
             let _entered = span.enter();
             let p0 = Instant::now();
             // Isolate a proving panic: a completion MUST always be sent, or the pipeline would
-            // wedge with `send_in_flight` stuck true.
+            // wedge with `proof_in_flight` stuck true.
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 prove_sign_pczt(pczt, orchard_circuit, &usk, &prover, &keys)
             }))
@@ -6442,25 +6457,26 @@ impl WalletActor {
             });
             // `usk` is dropped (zeroized) here.
         });
+        self.send_queue.proof_in_flight = true;
     }
 
-    /// Start the next queued send, draining sends whose phase A fails immediately so the queue
-    /// keeps moving. Stops once a send is in flight (its proof started) or the queue is empty.
-    async fn pump_send_queue(&mut self) {
-        while !self.send_in_flight {
-            let Some(p) = self.send_queue.pop_front() else {
-                break;
-            };
-            self.start_pipelined_send(p.request, p.confirmations, p.privacy, p.source, p.reply)
-                .await;
+    /// Isolate each payout so a panic cannot drop the remaining queue or stop the writer.
+    async fn start_send_caught(&mut self, send: PendingSend) {
+        use futures_util::FutureExt as _;
+        if std::panic::AssertUnwindSafe(self.start_send(send))
+            .catch_unwind()
+            .await
+            .is_err()
+        {
+            error!("queued send panicked; the actor continues");
         }
     }
 
     /// Phase C of a pipelined send, on the actor: store the proven tx (marking inputs spent),
-    /// reply to the caller, and broadcast. Clears `send_in_flight` first so a panic mid-commit
-    /// can't wedge the pipeline (the loop pumps the queue afterwards).
+    /// reply to the caller, and broadcast. Clears `proof_in_flight` first so a panic mid-commit
+    /// can't wedge the pipeline.
     async fn finish_send(&mut self, done: SendCompletion) {
-        self.send_in_flight = false;
+        self.send_queue.proof_in_flight = false;
         let SendCompletion {
             result,
             orchard_circuit,
@@ -6536,9 +6552,9 @@ impl WalletActor {
         Ok(txid)
     }
 
-    /// Run [`finish_send`](Self::finish_send) under panic isolation, then pump the send queue.
+    /// Run [`finish_send`](Self::finish_send) under panic isolation.
     /// Mirrors [`handle_command_caught`](Self::handle_command_caught): a panic on the commit path
-    /// must not take the actor (and every wallet write) down. `send_in_flight` is already cleared
+    /// must not take the actor (and every wallet write) down. `proof_in_flight` is already cleared
     /// inside `finish_send`, so the queue can always make progress afterwards.
     async fn finish_send_caught(&mut self, done: SendCompletion) {
         use futures_util::FutureExt as _;
@@ -6551,9 +6567,8 @@ impl WalletActor {
                 "pipelined send commit panicked; the actor continues (this is a bug - \
                  please report it)"
             );
-            self.send_in_flight = false;
+            self.send_queue.proof_in_flight = false;
         }
-        self.pump_send_queue().await;
     }
 
     /// Build, sign, record, and broadcast a **fully transparent** send: fund the payment directly
@@ -8237,7 +8252,7 @@ fn now_unix() -> i64 {
 /// with a non-empty Sapling bundle - spends are always Orchard and change goes to Orchard (Sapling
 /// isn't an enabled pool on that path, or `cached_pczt_path` is already false). The PCZT extractor
 /// (`extract_and_store_transaction_from_pczt`) rejects such a bundle without a Sapling *verifying*
-/// key, and the cached path passes none - so `do_send`/`begin_or_queue_send` divert these sends to
+/// key, and the cached path passes none - so `do_send`/`start_send` divert these sends to
 /// the fused `create_proposed_transactions` path, which builds, proves, and verifies Sapling
 /// outputs itself. A dual Orchard+Sapling UA is deliberately *not* flagged: an Orchard-only wallet
 /// routes the payment to the UA's Orchard receiver, so no Sapling output is produced. Keyed off the
@@ -8395,7 +8410,7 @@ fn prove_sign_pczt(
 /// marks inputs spent - the same wallet bookkeeping `create_proposed_transactions` does. A DB
 /// write, so it runs on the single-writer actor. The Sapling verifying key is `None` because this
 /// path is only reached for sends with **no Sapling output** - the extractor rejects a Sapling
-/// bundle without one, so `do_send`/`begin_or_queue_send` divert any send to a Sapling-only
+/// bundle without one, so `do_send`/`start_send` divert any send to a Sapling-only
 /// recipient to the fused path before reaching here (the guard is `request_pays_sapling_output`).
 /// Note this is about Sapling *outputs*, not spends: zecd never spends Sapling notes on this path,
 /// but a send can still *pay* a Sapling recipient. `N` (the note-ref type) is otherwise
@@ -8940,6 +8955,12 @@ fn classify_err(e: ProposalError) -> RpcError {
 /// safe: a `-6` means a proposal actually ran, which implies the chain tip is set (the
 /// `get_wallet_summary` progress-estimator underflow guarded against in `update_status`
 /// can't fire), and a failed lookup just leaves the message unenriched.
+/// Whether a send failed only because the chosen funds could not cover it (`-6`), as opposed to
+/// any other error, which must not be retried from another source.
+fn is_insufficient_funds<T>(result: &Result<T, RpcError>) -> bool {
+    matches!(result, Err(e) if e.code == codes::RPC_WALLET_INSUFFICIENT_FUNDS)
+}
+
 fn enrich_insufficient_funds(
     db: &WriteDb,
     engine_dir: &Path,
@@ -9021,6 +9042,202 @@ fn coinbase_hint(zats: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    fn queued_payout() -> super::PendingSend {
+        super::PendingSend {
+            request: super::TransactionRequest::empty(),
+            confirmations: None,
+            privacy: super::SendPrivacy::FullPrivacy,
+            source: super::SendSource::Unspecified,
+            reply: tokio::sync::oneshot::channel().0,
+        }
+    }
+
+    fn failed_proof() -> super::SendCompletion {
+        super::SendCompletion {
+            result: Err(super::RpcError::wallet("proof failed")),
+            orchard_circuit: None,
+            policy: Default::default(),
+            shape: Default::default(),
+            build_elapsed: Default::default(),
+            prove_elapsed: Default::default(),
+            reply: tokio::sync::oneshot::channel().0,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_rechecks_the_deadline_between_queued_payouts() {
+        use super::{SendQueue, ShutdownWork};
+        use tokio::time::{advance, Duration, Instant};
+
+        let (_, mut commands) = tokio::sync::mpsc::channel(1);
+        let (done, mut proofs) = tokio::sync::mpsc::channel(1);
+        let mut queue = SendQueue {
+            proof_in_flight: true,
+            ..Default::default()
+        };
+        queue.push(queued_payout());
+        queue.push(queued_payout());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        advance(Duration::from_secs(9)).await;
+        done.try_send(failed_proof()).unwrap();
+        assert!(matches!(
+            queue
+                .next_shutdown_work(&mut commands, &mut proofs, deadline)
+                .await,
+            Some(ShutdownWork::Proof(_))
+        ));
+        queue.proof_in_flight = false;
+        assert!(matches!(
+            queue
+                .next_shutdown_work(&mut commands, &mut proofs, deadline)
+                .await,
+            Some(ShutdownWork::Payout(_))
+        ));
+        // The first payout uses the remaining second. The second must never start.
+        advance(Duration::from_secs(1)).await;
+        assert!(queue
+            .next_shutdown_work(&mut commands, &mut proofs, deadline)
+            .await
+            .is_none());
+        assert_eq!(queue.pending.len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_waits_for_a_proof_started_by_the_last_buffered_command() {
+        use super::{SendQueue, ShutdownWork, WalletCommand};
+        use tokio::time::{sleep, Duration, Instant};
+
+        let (input, mut commands) = tokio::sync::mpsc::channel(1);
+        let (done, mut proofs) = tokio::sync::mpsc::channel(1);
+        let mut queue = SendQueue::default();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let send = queued_payout();
+        input
+            .try_send(WalletCommand::Send {
+                request: send.request,
+                confirmations: send.confirmations,
+                privacy: send.privacy,
+                source: send.source,
+                reply: send.reply,
+            })
+            .unwrap();
+        commands.close();
+        let Some(ShutdownWork::Command(WalletCommand::Send {
+            request,
+            confirmations,
+            privacy,
+            source,
+            reply,
+        })) = queue
+            .next_shutdown_work(&mut commands, &mut proofs, deadline)
+            .await
+        else {
+            panic!("expected the buffered payout command")
+        };
+        queue.push(super::PendingSend {
+            request,
+            confirmations,
+            privacy,
+            source,
+            reply,
+        });
+        assert!(matches!(
+            queue
+                .next_shutdown_work(&mut commands, &mut proofs, deadline)
+                .await,
+            Some(ShutdownWork::Payout(_))
+        ));
+        queue.proof_in_flight = true;
+        let (work, ()) = tokio::join!(
+            queue.next_shutdown_work(&mut commands, &mut proofs, deadline),
+            async {
+                sleep(Duration::from_secs(2)).await;
+                done.try_send(failed_proof()).unwrap();
+            },
+        );
+        assert!(matches!(work, Some(ShutdownWork::Proof(_))));
+        queue.proof_in_flight = false;
+        assert!(queue
+            .next_shutdown_work(&mut commands, &mut proofs, deadline)
+            .await
+            .is_none());
+        assert!(Instant::now() < deadline);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_spends_only_the_remaining_time_waiting_for_a_proof() {
+        use super::SendQueue;
+        use tokio::time::{advance, Duration, Instant};
+
+        let (_, mut commands) = tokio::sync::mpsc::channel(1);
+        let (_done, mut proofs) = tokio::sync::mpsc::channel(1);
+        let mut queue = SendQueue {
+            proof_in_flight: true,
+            ..Default::default()
+        };
+        queue.push(queued_payout());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        advance(Duration::from_secs(9)).await;
+        assert!(queue
+            .next_shutdown_work(&mut commands, &mut proofs, deadline)
+            .await
+            .is_none());
+        assert_eq!(Instant::now(), deadline);
+        assert!(queue.proof_in_flight);
+        assert_eq!(queue.pending.len(), 1);
+    }
+
+    #[test]
+    fn overlapping_sends_wait_in_order_with_their_original_policies() {
+        use super::{
+            ConfirmationsPolicy, PendingSend, SendPrivacy, SendQueue, SendSource,
+            TransactionRequest,
+        };
+        use crate::wallet::ShieldedFamily;
+
+        let policies = [
+            (
+                SendSource::Unspecified,
+                SendPrivacy::AllowFullyTransparent,
+                None,
+            ),
+            (
+                SendSource::Transparent(None),
+                SendPrivacy::AllowRevealedSenders,
+                Some(ConfirmationsPolicy::MIN),
+            ),
+            (
+                SendSource::ShieldedFamily(ShieldedFamily::Orchard),
+                SendPrivacy::FullPrivacy,
+                Some(ConfirmationsPolicy::default()),
+            ),
+        ];
+        let mut queue = SendQueue {
+            proof_in_flight: true,
+            ..Default::default()
+        };
+        for (source, privacy, confirmations) in policies {
+            let (reply, _) = tokio::sync::oneshot::channel();
+            queue.push(PendingSend {
+                request: TransactionRequest::empty(),
+                confirmations,
+                privacy,
+                source,
+                reply,
+            });
+            assert!(
+                queue.pop_ready().is_none(),
+                "a pending proof holds the inputs"
+            );
+        }
+        queue.proof_in_flight = false;
+        for expected in policies {
+            let send = queue.pop_ready().expect("queued send");
+            assert_eq!((send.source, send.privacy, send.confirmations), expected);
+        }
+        assert!(queue.pop_ready().is_none());
+    }
+
     #[test]
     fn orchard_bundles_prove_under_the_circuit_their_branch_names() {
         use super::orchard_circuit_for_branch;

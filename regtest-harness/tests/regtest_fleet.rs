@@ -236,31 +236,33 @@ async fn regtest_fleet_many_view_wallets_are_scanned_together_and_stay_isolated(
             "wallet '{}' was handed an address another fleet wallet already has",
             wallet.name
         );
-        // And it belongs to the wallet that asked for it.
-        let info = zecd
-            .call_wallet(&wallet.name, "getaddressinfo", json!([address.clone()]))
-            .await
-            .expect("getaddressinfo");
-        assert_eq!(
-            info["ismine"],
-            json!(true),
-            "wallet '{}' must own the address it just issued",
-            wallet.name
-        );
-        // A shard-mate must not claim it. Picking the *other* wallets keeps this meaningful
-        // whichever shard the pair landed in.
-        for other in wallets.iter().filter(|w| w.name != wallet.name) {
+        for method in ["getaddressinfo", "validateaddress"] {
+            // And it belongs to the wallet that asked for it.
             let info = zecd
-                .call_wallet(&other.name, "getaddressinfo", json!([address.clone()]))
+                .call_wallet(&wallet.name, method, json!([address.clone()]))
                 .await
-                .expect("getaddressinfo");
+                .expect(method);
             assert_eq!(
                 info["ismine"],
-                json!(false),
-                "wallet '{}' must not claim '{}'s address",
-                other.name,
+                json!(true),
+                "wallet '{}' must own the address it just issued",
                 wallet.name
             );
+            // A shard-mate must not claim it. Picking the *other* wallets keeps this meaningful
+            // whichever shard the pair landed in.
+            for other in wallets.iter().filter(|w| w.name != wallet.name) {
+                let info = zecd
+                    .call_wallet(&other.name, method, json!([address.clone()]))
+                    .await
+                    .expect(method);
+                assert_eq!(
+                    info["ismine"],
+                    json!(false),
+                    "wallet '{}' must not claim '{}'s address",
+                    other.name,
+                    wallet.name
+                );
+            }
         }
     }
 

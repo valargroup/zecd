@@ -68,12 +68,10 @@ pub async fn run(state: HttpState) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Maximum accepted HTTP request-body size. JSON-RPC requests - even large batches - are small,
-/// so this bounds memory from a hostile or buggy client while staying generous. It makes axum's
-/// otherwise-implicit limit explicit and tunable; oversize requests are rejected with HTTP 413 by
-/// the body-limit layer, before auth or dispatch.
+/// A full two-million-byte block occupies four million hex characters in a mining
+/// request. Leave room for JSON framing and a batched lookup of the submitted block.
 #[cfg(feature = "server")]
-const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
+const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 
 #[cfg(feature = "server")]
 fn router(state: HttpState) -> Router {
@@ -188,7 +186,7 @@ async fn handle(
     );
 
     match jsonrpc::parse_body(&body) {
-        Err(e) => json_response(status_for(&e), &jsonrpc::error(Value::Null, &e)),
+        Err(e) => json_response(status_for(&e), &jsonrpc::Reply::error(Value::Null, &e)),
         Ok(Body::Single(v)) => {
             let (resp, status) = process_single(&state.app, wallet.as_deref(), v).await;
             json_response(status, &resp)
@@ -200,7 +198,7 @@ async fn handle(
                 let (resp, _) = process_single(&state.app, wallet.as_deref(), v).await;
                 out.push(resp);
             }
-            json_response(StatusCode::OK, &Value::Array(out))
+            json_response(StatusCode::OK, &out)
         }
     }
 }
@@ -221,11 +219,19 @@ fn status_for(err: &crate::error::RpcError) -> StatusCode {
 /// Validate and dispatch one request, returning `(envelope, http_status)`. Registers the
 /// command as active (for `getrpcinfo`) and emits one structured log line per call.
 #[cfg(feature = "server")]
-async fn process_single(state: &AppState, wallet: Option<&str>, v: Value) -> (Value, StatusCode) {
+async fn process_single(
+    state: &AppState,
+    wallet: Option<&str>,
+    mut v: Value,
+) -> (jsonrpc::Reply, StatusCode) {
+    let named = v
+        .get_mut("params")
+        .filter(|p| p.is_object())
+        .map(Value::take);
     match RpcRequest::from_value(v) {
         Err((id, err)) => {
             tracing::debug!(code = err.code, message = %err.message, "rpc request rejected");
-            (jsonrpc::error(id, &err), status_for(&err))
+            (jsonrpc::Reply::error(id, &err), status_for(&err))
         }
         Ok(req) => {
             let _active = state.active.begin(&req.method);
@@ -238,7 +244,9 @@ async fn process_single(state: &AppState, wallet: Option<&str>, v: Value) -> (Va
             let span = tracing::info_span!("rpc", method = %req.method, wallet = wallet.unwrap_or("default"));
             let result = {
                 use tracing::Instrument as _;
-                rpc::dispatch(state, wallet, &req).instrument(span).await
+                rpc::dispatch(state, wallet, &req, named)
+                    .instrument(span)
+                    .await
             };
             let elapsed_ms = start.elapsed().as_millis() as u64;
             match result {
@@ -253,7 +261,7 @@ async fn process_single(state: &AppState, wallet: Option<&str>, v: Value) -> (Va
                     } else {
                         tracing::debug!(method = %req.method, wallet = wallet.unwrap_or("default"), elapsed_ms, "rpc ok");
                     }
-                    (jsonrpc::success(req.id, value), StatusCode::OK)
+                    (jsonrpc::Reply::success(req.id, value), StatusCode::OK)
                 }
                 Err(err) => {
                     // A method-not-found is a client-side probe, not an operational event: a
@@ -267,7 +275,7 @@ async fn process_single(state: &AppState, wallet: Option<&str>, v: Value) -> (Va
                     } else {
                         tracing::info!(method = %req.method, wallet = wallet.unwrap_or("default"), elapsed_ms, code = err.code, message = %err.message, "rpc error");
                     }
-                    (jsonrpc::error(req.id, &err), status_for(&err))
+                    (jsonrpc::Reply::error(req.id, &err), status_for(&err))
                 }
             }
         }
@@ -275,7 +283,7 @@ async fn process_single(state: &AppState, wallet: Option<&str>, v: Value) -> (Va
 }
 
 #[cfg(feature = "server")]
-fn json_response(status: StatusCode, body: &Value) -> Response {
+fn json_response(status: StatusCode, body: &impl serde::Serialize) -> Response {
     let bytes = serde_json::to_vec(body).unwrap_or_else(|_| b"{}".to_vec());
     (status, [(header::CONTENT_TYPE, "application/json")], bytes).into_response()
 }
@@ -398,6 +406,7 @@ mod tests {
                 active: crate::state::ActiveCommands::default(),
                 operations: Arc::new(crate::operations::OperationRegistry::new()),
                 fleet: None,
+                node_hub: None,
                 spend_limits: crate::config::SpendLimits::new(
                     &crate::config::SpendConfig::default(),
                 ),
@@ -516,6 +525,71 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn forwards_a_full_block_and_named_lookup_in_one_batch() {
+        use axum::Json;
+        use serde_json::json;
+        let node = Router::new()
+            .route(
+                "/",
+                post(|Json(request): Json<Value>| async move {
+                    let result = match request["method"].as_str().unwrap() {
+                        "getblockchaininfo" => {
+                            json!({"chain":"regtest","blocks":1,"bestblockhash":"00"})
+                        }
+                        "submitblock" => {
+                            let raw = request["params"][0].as_str().unwrap();
+                            assert_eq!(raw.len(), 4_000_000);
+                            assert!(raw
+                                .as_bytes()
+                                .as_chunks::<2>()
+                                .0
+                                .iter()
+                                .all(|pair| pair == b"ab"));
+                            Value::Null
+                        }
+                        "getblock" => request["params"].clone(),
+                        method => panic!("unexpected forwarded method {method}"),
+                    };
+                    Json(json!({"id":request["id"],"result":result,"error":null}))
+                }),
+            )
+            .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, node).await.unwrap() });
+        let mut state = test_state();
+        Arc::make_mut(&mut state.app.config).rpc.allowed_methods =
+            vec!["submitblock".into(), "getblock".into()];
+        let backend =
+            crate::backend::resolve(&format!("zebra://{address}"), state.app.config.network)
+                .unwrap();
+        state.app.node_hub = Some(crate::chain::hub::ChainHub::new(
+            backend,
+            Duration::from_secs(10),
+        ));
+        let named = json!({"hash_or_height":"tip","verbosity":1});
+        let batch = json!([
+            {"method":"submitblock","id":1,"params":["ab".repeat(2_000_000)]},
+            {"method":"getblock","id":2,"params":named},
+            {"method":"getdifficulty","id":3,"params":{}}
+        ]);
+        let response = router(state)
+            .oneshot(req(&batch.to_string(), Some(("u", "p"))))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let wire = std::str::from_utf8(&body).unwrap();
+        assert!(wire.starts_with(r#"[{"result":null,"error":null,"id":1},{"result":"#));
+        let replies: Value = serde_json::from_str(wire).unwrap();
+        assert_eq!(replies[1]["result"], named);
+        assert_eq!(replies[2]["error"]["code"], -32601);
+        server.abort();
     }
 
     #[tokio::test]
@@ -1287,6 +1361,7 @@ mod tests {
             r#"{"method":"getreceivedbyaddress","id":1,"params":["uaddr"]}"#,
             r#"{"method":"listreceivedbyaddress","id":1,"params":[]}"#,
             r#"{"method":"getbalances","id":1,"params":[]}"#,
+            r#"{"method":"z_getbalance","id":1,"params":["uaddr",8]}"#,
             r#"{"method":"getrawtransaction","id":1,"params":["00"]}"#,
             r#"{"method":"sendrawtransaction","id":1,"params":["00"]}"#,
             r#"{"method":"z_validateaddress","id":1,"params":["tmGqwWtL7RsbxikDSN26gsbicxVr2xJNe86"]}"#,
@@ -1365,6 +1440,7 @@ mod tests {
             );
             assert!(!obj.contains_key("scriptPubKey"));
             assert!(!obj.contains_key("isscript"));
+            assert!(!obj.contains_key("ismine"));
             assert!(obj.contains_key("error"));
             assert!(obj.contains_key("error_locations"));
         }
@@ -1383,5 +1459,6 @@ mod tests {
         );
         assert_eq!(v["isscript"], serde_json::json!(false));
         assert_eq!(v["iswitness"], serde_json::json!(false));
+        assert!(v.get("ismine").is_none(), "no wallet is loaded");
     }
 }

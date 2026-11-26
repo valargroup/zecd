@@ -230,6 +230,22 @@ pub fn init_dbs_with(
     enable_wal(engine_dir)?;
     let mut db_data = open_write_with(network, engine_dir, options)?;
     init_wallet_db(&mut db_data, None)?;
+    // A compact scan knows each reward's block position even without the full transaction.
+    // Capture that evidence in the rewind transaction, before librustzcash clears the position.
+    // Installing this after its migrations also covers already-mined rewards in existing wallets.
+    let conn = rusqlite::Connection::open(data_db_path(engine_dir))?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS zecd_detached_rewards (
+             txid BLOB PRIMARY KEY NOT NULL
+         ) WITHOUT ROWID;
+         CREATE TRIGGER IF NOT EXISTS zecd_remember_detached_reward
+         AFTER UPDATE OF tx_index ON transactions
+         WHEN OLD.tx_index = 0 AND OLD.mined_height IS NOT NULL
+              AND NEW.mined_height IS NULL AND NEW.tx_index IS NULL
+         BEGIN
+             INSERT OR IGNORE INTO zecd_detached_rewards(txid) VALUES (OLD.txid);
+         END;",
+    )?;
     Ok(db_data)
 }
 

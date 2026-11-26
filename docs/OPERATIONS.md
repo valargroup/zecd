@@ -38,6 +38,16 @@ Know the assumptions so you can see when you are widening the trust boundary.
   `zecd init --encrypt` (Bitcoin-Core-style passphrase, unlocked per session with an enforced
   timeout) whenever unattended spend authority is not actually required.
 
+**Node calls through zecd.** On a zebra backend, zecd forwards `getblocktemplate`,
+`submitblock`, `getblock`, `getblocksubsidy`, `getmininginfo`, `getdifficulty`,
+`getnetworkhashps` and `getnetworksolps` to the node under zecd's own `[zebra]`
+credentials. When the node omits `getmininginfo.difficulty`, zecd requests it with
+`getdifficulty` for pool statistics. An authenticated caller with access to these methods can ask the node for block
+templates and relay blocks to it. If that is more than a deployment needs,
+leave those methods out of `[rpc] allowed_methods`. Node errors come back with the node's own
+code and message; a node that cannot be reached is a generic `-1`, with the details (which name
+the node's address) in zecd's log only. A lightwalletd backend answers `-32601`.
+
 See the README **Security** section for the underlying rationale (RPC credentials as spend
 authority, custody models, the cleartext gate).
 
@@ -271,6 +281,62 @@ work-queue 503s; daemon restarts.
   failed and safe to re-send.
 - Rapid back-to-back sends can exhaust spendable notes (`-6`) until change confirms.
 
+## Mining pools
+
+zecd can serve mining RPCs and wallet RPCs at one endpoint. The upstream node validates
+the block the pool submits. The wallet receives transparent coinbase rewards, shields
+mature rewards and pays recipients. Two client behaviors affect deployment:
+
+| Client revision | Behavior and operator action |
+| --- | --- |
+| [s-nomp e6498056](https://github.com/s-nomp/s-nomp/tree/e6498056547d77d684097fe3024eb47110177e30) | Its transparent-wallet refill subtracts only 0.0001 ZEC from the shielded balance. If ZIP 317 requires more, the operation ends with insufficient funds (`-6`) and sends nothing. Change the refill amount to leave enough for the transaction fee before enabling automatic refills. Its payment processor replaces an `orphan` category with `immature` when confirmations are below its threshold. Preserve `orphan` before applying the depth check so disconnected rounds can be retired. [Payment processor](https://github.com/s-nomp/s-nomp/blob/e6498056547d77d684097fe3024eb47110177e30/libs/paymentProcessor.js#L795-L809) Its payouts call `sendmany ""`, and its balance check sums `listunspent`, which lists transparent and shielded funds. Under the default privacy policy zecd pays such a send from shielded notes only, so funds a successful refill moved to the payout t-address stay there unused. Set `[spend] privacy_policy = "AllowFullyTransparent"` on the daemon serving s-nomp: `sendmany` then pays from the transparent funds while they cover the payout and from shielded notes when they do not. Sends that name a source, such as `z_sendmany` from the pool's unified address, are not affected. |
+| [Miningcore a553f623](https://github.com/oliverw/miningcore/tree/a553f62301f44c6df80891e408b6526d1dd98692) | A 50-recipient payout can succeed when the balance covers all outputs and the ZIP 317 fee. A near-balance payout reserving only 0.0001 ZEC can fail with `-6`. |
+
+Both stock block builders leave the coinbase expiry height at zero. On mainnet from NU5
+onward, consensus requires the expiry height to equal the height of the block being mined.
+Use a compatible block builder with either client before mining. [ZIP 203](https://zips.z.cash/zip-0203)
+
+For either client, poll the operation to completion and record the returned transaction ID
+before marking a payout as sent. The regtest covers node-built blocks and wallet payments.
+
+**Requirements.**
+- A zebra backend (`server = "zebra"`): the mining calls are forwarded to that node, and a
+  lightwalletd backend has none to forward to.
+- Transparent receiving on the wallet: `[pools] transparent = true`.
+- Miningcore can pay transparent recipients from its unified address with the default
+  `AllowRevealedRecipients` policy. For s-nomp to spend the transparent payout address it
+  refills, set `[spend] privacy_policy = "AllowFullyTransparent"`. This makes the payout's
+  transparent inputs and change public. The setting applies to every wallet served by that
+  daemon. Run the pool wallet on a separate zecd instance if other wallets need a different
+  default privacy policy. Both clients can use `z_shieldcoinbase` with its
+  default policy.
+
+**Addresses.**
+- The coinbase address: `getnewaddress "" "transparent"`. Set it as the node's
+  `[mining] miner_address`.
+- The shielded payout address: `z_getaddressforaccount 0 ["orchard"]` (its `address` field).
+  zecd has one account per wallet, so account 0 is the wallet's.
+- s-nomp: `address` is the coinbase address, `zAddress` the unified address, and `tAddress` a
+  second `getnewaddress "" "transparent"` address that s-nomp refills from `zAddress` and pays
+  miners from.
+- Miningcore: `address` is the coinbase address and `z-address` the unified address.
+
+**What zecd does with the pool calls.**
+- `gettransaction` and wallet history report a mined transparent reward as `immature` until
+  the wallet has scanned 100 confirmations, then as `generate`. A mined shielded reward
+  reports `generate` immediately. Either kind reports `orphan` when its block leaves the
+  chain. Coinbase transactions carry `generated: true`.
+- `z_getbalance <address> [minconf]`: for a transparent address, its unspent outputs at that
+  depth (immature coinbase is never counted); for one of the wallet's unified or Sapling
+  addresses, the wallet's spendable balance in the pools that address can receive into (Orchard
+  and Ironwood for an Orchard receiver, Sapling for a Sapling one).
+- An explicit fee on `z_sendmany`, `z_shieldcoinbase` or `z_mergetoaddress` (Miningcore always
+  passes 0.0001) is accepted and logged, and the ZIP 317 fee is what is paid. A 50-recipient
+  payout costs more than 0.0001 ZEC under ZIP 317. A negative or non-numeric fee is still
+  refused.
+- `getblocktemplate` has the node's 30 second call limit, so long polling is not supported.
+- `getaccount` is not implemented; s-nomp carries on when it fails.
+
 ## Reading history: transactions someone else helped fund
 
 A transaction can spend the wallet's funds alongside inputs that belong to someone else: a
@@ -378,9 +444,10 @@ signal arriving in that window used to discard the send: nothing had been broadc
 were at risk, but the record of whether it happened was lost - on exactly the restart boundary
 where the in-memory operation registry makes that hardest to reconstruct.
 
-On shutdown the wallet now finishes what it has already accepted, bounded by `[spend]
-shutdown_drain_secs` (default 60). Set it **below your supervisor's own stop timeout**, because
-that is what actually bounds it:
+On shutdown, buffered commands, queued payouts, and their proofs share one deadline set by
+`[spend] shutdown_drain_secs` (default 60). At the deadline the wallet stops starting payouts
+and waiting for proofs. A payout already executing inline, or a proof already being stored and
+broadcast, finishes its current operation. Leave room for that in your supervisor's stop timeout.
 
 | supervisor | default grace period | setting to raise |
 |---|---|---|

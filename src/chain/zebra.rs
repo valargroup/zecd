@@ -489,7 +489,24 @@ impl ZebraClient {
                 "zebra rpc returned HTTP {status}"
             )));
         }
-        Ok(envelope.get("result").cloned().unwrap_or(Value::Null))
+        envelope.get("result").cloned().ok_or_else(|| {
+            CallError::Transport(anyhow!("zebra rpc response is missing its result"))
+        })
+    }
+
+    /// [`Self::call`] for a caller forwarding a request it did not build itself: the node's
+    /// refusal is kept as data rather than folded into a transport error.
+    pub async fn passthrough(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, super::PassthroughError> {
+        self.call(method, params).await.map_err(|e| match e {
+            CallError::Rpc { code, message } => super::PassthroughError::Rpc { code, message },
+            CallError::Transport(e) => {
+                super::PassthroughError::Transport(e.context(format!("zebra rpc {method}")))
+            }
+        })
     }
 
     /// `call` + deserialize, for methods where any RPC error is a transport-class failure.
@@ -789,6 +806,15 @@ impl ZebraSource {
             chain_name: info.chain,
             mempool_poll: MEMPOOL_POLL_INTERVAL,
         })
+    }
+
+    /// Forward one JSON-RPC call to the node (see [`ZebraClient::passthrough`]).
+    pub async fn passthrough(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, super::PassthroughError> {
+        self.client.passthrough(method, params).await
     }
 
     /// Fetch all completed note-commitment-subtree roots for a zebra pool label
