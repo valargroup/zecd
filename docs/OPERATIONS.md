@@ -463,6 +463,19 @@ exceeds every common default. `0` disables the drain.
 Operation status objects are in-memory and do not survive the restart either way; reconcile by
 txid (`gettransaction`), not by opid.
 
+## GitHub releases in valargroup/zecd
+
+Push a `v<version>` tag on the release commit to publish its Linux amd64 and arm64
+builds. The tag must match the package version in `Cargo.toml`, including any
+prerelease suffix. After both binaries run successfully and both architectures
+are packaged, the workflow publishes their tarballs, Debian packages and
+`SHA256SUMS` together on the [GitHub release](https://github.com/valargroup/zecd/releases).
+Versions with a prerelease suffix are marked as prereleases.
+
+To preview packages, run **Release** from the Actions tab using the ref and
+version you want to inspect. Download the `verified-release` artifact from
+that run. Manual runs in this repository only produce workflow artifacts.
+
 ## Upgrades
 
 1. Check the config against the **new** binary before anything else, while the old one is
