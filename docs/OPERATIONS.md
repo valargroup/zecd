@@ -467,7 +467,8 @@ txid (`gettransaction`), not by opid.
 
 Push a `v<version>` tag on the release commit to publish its Linux amd64 and arm64
 builds. The tag must match the package version in `Cargo.toml`, including any
-prerelease suffix. After both binaries run successfully and both architectures
+prerelease suffix. Cargo builds both statically linked musl binaries on native
+GitHub Actions runners. After both binaries run successfully and both architectures
 are packaged, the workflow publishes their tarballs, Debian packages and
 `SHA256SUMS` together on the [GitHub release](https://github.com/valargroup/zecd/releases).
 Versions with a prerelease suffix are marked as prereleases.
