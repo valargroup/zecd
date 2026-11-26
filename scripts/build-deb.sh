@@ -2,11 +2,9 @@
 #
 # Build a reproducible Debian package (.deb) for zecd from a pre-built binary.
 #
-# The binary itself is expected to already be a *reproducible* artifact - in CI it is
-# extracted from the `export` stage of the StageX (amd64) / pinned-Alpine (arm64)
-# Dockerfiles, which carry all the determinism flags (SOURCE_DATE_EPOCH, codegen-units=1,
-# --build-id=none) and produce a static musl binary on both architectures. This script only
-# wraps that binary, so it must not reintroduce nondeterminism: every file gets a fixed mtime
+# CI builds a static musl binary with Cargo on each native Linux runner. Given
+# the same binary and source files, this script produces the same package:
+# every file gets a fixed mtime
 # (SOURCE_DATE_EPOCH), `dpkg-deb --root-owner-group` pins uid/gid to root:root, and gzip is
 # invoked with `-n` so the changelog has no embedded name/timestamp. dpkg-deb (>= 1.18.11) then
 # honors SOURCE_DATE_EPOCH for the ar member timestamps, yielding a bit-for-bit identical .deb.

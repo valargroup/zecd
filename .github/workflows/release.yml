@@ -1,51 +1,33 @@
 name: Release
 
-# Tag-driven release tier: pushing a `v*` tag builds the release artifacts for both Linux
-# targets and attaches them to a *draft* GitHub release (a human reviews and publishes),
-# pushes Docker images to GHCR tagged with the semver version, and publishes the crate to
-# crates.io. Note the asymmetry: the GitHub release waits for a human, but the GHCR images and
-# the crates.io version go out on the tag push and cannot be recalled (only overwritten and
-# yanked respectively), so the tag is the point of no return, not the publish button.
+# In valargroup/zecd, a version tag publishes the verified Linux packages as a
+# GitHub Release. Pull requests and manual runs can build the same packages for
+# inspection. The crates.io job is excluded in this fork.
 #
-# Binaries are extracted from the `export` stage of the project Dockerfiles rather than a
-# fresh `cargo build`, so the published binaries inherit the exact *reproducible* build
-# pipeline the images use:
-#   * x86_64 (amd64): the StageX `Dockerfile` - full-source-bootstrapped, static musl,
-#     bit-for-bit reproducible.
-#   * aarch64 (arm64): the pinned `Dockerfile.arm64` - deterministic (digest-pinned base,
-#     version-pinned apk toolchain, SOURCE_DATE_EPOCH, --build-id=none), static musl, built
-#     natively on an arm64 runner. Not StageX-grade trust (upstream binaries, not
-#     full-source-bootstrapped), but bit-for-bit reproducible.
-# Each target ships a `.tar.gz` (reproducible tar: sorted, fixed mtime, root-owned) and a
-# reproducible `.deb` (see scripts/build-deb.sh). Instead of a per-file `.sha256` sidecar the
-# release carries one `SHA256SUMS` covering every artifact, in the standard `sha256sum -c`
-# format (generated in the `release` job once all arches are gathered). Artifacts use one arch
-# token per target - the Debian/Go names amd64/arm64, the fixed point set by the `.deb`
-# convention - so a release lists `zecd-<ver>-linux-{amd64,arm64}.tar.gz` next to
-# `zecd_<ver>_{amd64,arm64}.deb` (no rust target triples in filenames).
-#
-# It can also be run manually (Actions tab -> Release -> Run workflow), e.g. to dry-run the
-# packaging without cutting a real tag: supply a `version` and, off by default, choose
-# whether to also push the GHCR images. Manual runs still produce a *draft* release.
+# Cargo builds a static-musl binary on each native Linux runner. Each target
+# ships a tarball and a Debian package. The release includes one SHA256SUMS
+# file covering both architectures.
 
 on:
   push:
     tags: ["v*"]
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - scripts/build-deb.sh
   workflow_dispatch:
     inputs:
       version:
         description: "Release version (with or without a leading v), e.g. 0.1.0 or v0.1.0-rc1"
         required: true
         default: "0.0.0-test"
-      push_images:
-        description: "Also build and push the GHCR Docker images (off for a packaging dry-run)"
-        type: boolean
-        required: false
-        default: false
 
 permissions:
-  contents: write
-  packages: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # Resolve the version/tag once so tag pushes and manual dispatch share one source of truth.
@@ -54,56 +36,104 @@ jobs:
     outputs:
       version: ${{ steps.v.outputs.version }}
       tag: ${{ steps.v.outputs.tag }}
+      commit: ${{ steps.v.outputs.commit }}
     steps:
-      - id: v
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            RAW="${{ inputs.version }}"
-          else
-            RAW="${GITHUB_REF_NAME}"
-          fi
-          VERSION="${RAW#v}"          # strip a leading v if present
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "Resolved version=${VERSION} tag=v${VERSION}"
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
-  # Build the reproducible binary + tarball + .deb for one Linux target.
+      - id: v
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          case "$GITHUB_EVENT_NAME" in
+            workflow_dispatch) version="${INPUT_VERSION#v}" ;;
+            pull_request) version="" ;;
+            push) version="${GITHUB_REF_NAME#v}" ;;
+          esac
+          if [[ "$GITHUB_EVENT_NAME" == pull_request ||
+                ( "$GITHUB_EVENT_NAME" == push && "$GITHUB_REPOSITORY" == valargroup/zecd ) ]]; then
+            manifest_version="$(python3 -c 'import tomllib; print(tomllib.loads(open("Cargo.toml").read())["package"]["version"])')"
+            if [[ "$GITHUB_EVENT_NAME" == push && "$version" != "$manifest_version" ]]; then
+              echo "::error::Tag $GITHUB_REF_NAME must match the zecd package version (v$manifest_version)."
+              exit 1
+            fi
+            version="$manifest_version"
+          fi
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]; then
+            echo "::error::Expected a version like 0.10.0 or 0.10.0-rc1."
+            exit 1
+          fi
+          {
+            echo "version=$version"
+            echo "tag=v$version"
+            echo "commit=$(git rev-parse HEAD)"
+          } >> "$GITHUB_OUTPUT"
+
+  # Build and package one statically linked Linux binary.
   binary:
     needs: setup
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-latest
-            dockerfile: Dockerfile
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
             arch: amd64
           - runner: ubuntu-24.04-arm
-            dockerfile: Dockerfile.arm64
+            target: aarch64-unknown-linux-musl
             arch: arm64
     runs-on: ${{ matrix.runner }}
     env:
-      # Determinism anchor - matches the Dockerfiles and scripts/build-deb.sh.
+      # Fixed archive timestamps and a pinned Rust toolchain on both runners.
       SOURCE_DATE_EPOCH: "1"
+      RUSTUP_TOOLCHAIN: "1.97.1"
     steps:
       - uses: actions/checkout@v4
-
-      - uses: docker/setup-buildx-action@v3
-
-      # Extract the bare, reproducible binary from the Dockerfile's `export` stage.
-      - name: Build binary (Docker export stage)
-        uses: docker/build-push-action@v6
         with:
-          context: .
-          file: ${{ matrix.dockerfile }}
-          target: export
-          outputs: type=local,dest=out
-          cache-from: type=gha,scope=binary-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=binary-${{ matrix.arch }}
+          ref: ${{ needs.setup.outputs.commit }}
+          persist-credentials: false
+
+      - name: Install the native musl compiler and protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools protobuf-compiler
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+
+      - name: Build the static binary with Cargo
+        env:
+          TARGET: ${{ matrix.target }}
+          TARGET_CC: musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CARGO_INCREMENTAL: "0"
+          CARGO_NET_RETRY: "10"
+          RUSTFLAGS: "-C codegen-units=1 -C target-feature=+crt-static -C link-arg=-Wl,--build-id=none"
+        run: |
+          cargo build --locked --release --bin zecd --features mimalloc-secure --target "$TARGET"
+          install -D -m 0755 "target/$TARGET/release/zecd" out/zecd
+
+      - name: Verify static linking and smoke-test the binary
+        run: |
+          program_headers="$(readelf --program-headers --wide out/zecd)"
+          dynamic_section="$(readelf --dynamic --wide out/zecd)"
+          if [[ "$program_headers" == *INTERP* || "$dynamic_section" == *NEEDED* ]]; then
+            echo "::error::Release binary has a dynamic interpreter or shared library dependency."
+            exit 1
+          fi
+          ./out/zecd --version
 
       - name: Package tarball (reproducible)
+        env:
+          VERSION: ${{ needs.setup.outputs.version }}
+          ARCH: ${{ matrix.arch }}
         run: |
-          VERSION="${{ needs.setup.outputs.version }}"
-          STAGE="zecd-${VERSION}-linux-${{ matrix.arch }}"
+          STAGE="zecd-${VERSION}-linux-${ARCH}"
           install -D -m 0755 out/zecd "$STAGE/zecd"
           cp README.md CHANGELOG.md LICENSE-MIT LICENSE-APACHE THIRD-PARTY-LICENSES.txt zecd.example.toml "$STAGE/"
           # Reproducible tar: stable order, fixed mtime, root owner; gzip -n drops the
@@ -113,9 +143,10 @@ jobs:
           gzip -9n "$STAGE.tar"
 
       - name: Build .deb (reproducible)
-        run: |
-          VERSION="${{ needs.setup.outputs.version }}"
-          ./scripts/build-deb.sh out/zecd "$VERSION" "${{ matrix.arch }}" .
+        env:
+          VERSION: ${{ needs.setup.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+        run: ./scripts/build-deb.sh out/zecd "$VERSION" "$ARCH" .
 
       - name: Upload release artifacts
         uses: actions/upload-artifact@v4
@@ -125,18 +156,21 @@ jobs:
             zecd-*.tar.gz
             zecd_*.deb
           if-no-files-found: error
+          overwrite: true
 
-  # Collect every target's artifacts and attach them to a single draft release.
-  release:
+  # Assemble the same verified bundle for a PR, dry run, or tag.
+  assemble:
     needs: [setup, binary]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+        if: github.repository == 'valargroup/zecd' && github.event_name != 'workflow_dispatch'
+        with:
+          ref: ${{ needs.setup.outputs.commit }}
+          persist-credentials: false
+
       - uses: actions/download-artifact@v4
         with:
-          # Only the packaged release artifacts - NOT the `.dockerbuild` metadata
-          # artifacts that docker/build-push-action auto-uploads from the `binary` jobs.
-          # Without this filter, download-artifact also fetches the flaky `.dockerbuild`
-          # download (which the release doesn't need) and fails the whole job.
           pattern: release-*
           path: dist
           merge-multiple: true
@@ -147,12 +181,68 @@ jobs:
       # (cd dist) so the file verifies against downloads sitting in one directory, and the list
       # is sorted by filename for a byte-stable, reproducible SHA256SUMS.
       - name: Generate SHA256SUMS
+        env:
+          VERSION: ${{ needs.setup.outputs.version }}
         run: |
           cd dist
-          sha256sum zecd-*.tar.gz zecd_*.deb | sort -k2 > SHA256SUMS
-          cat SHA256SUMS
+          archives=("zecd-$VERSION-linux-amd64.tar.gz" "zecd-$VERSION-linux-arm64.tar.gz")
+          packages=("zecd_${VERSION}_amd64.deb" "zecd_${VERSION}_arm64.deb")
+          sha256sum "${archives[@]}" "${packages[@]}" > SHA256SUMS
+          sha256sum --strict --check SHA256SUMS
+
+      - name: Extract the version's changelog entry
+        if: github.repository == 'valargroup/zecd' && github.event_name != 'workflow_dispatch'
+        env:
+          VERSION: ${{ needs.setup.outputs.version }}
+        run: |
+          awk -v heading="## [$VERSION]" '
+            /^## / { if (found) exit; found = index($0, heading " - ") == 1; next }
+            found { print; if (NF) has_notes = 1 }
+            END { if (!has_notes) exit 1 }
+          ' CHANGELOG.md > dist/release-notes.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: verified-release
+          path: dist/
+          if-no-files-found: error
+          overwrite: true
+
+  release:
+    needs: [setup, assemble]
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.repository != 'valargroup/zecd')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: verified-release
+          path: dist
+
+      - name: Publish the Valargroup GitHub Release
+        if: github.repository == 'valargroup/zecd'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.setup.outputs.tag }}
+          COMMIT: ${{ needs.setup.outputs.commit }}
+        run: |
+          tagged_commit="$(gh api "repos/$GITHUB_REPOSITORY/commits/refs%2Ftags%2F$TAG" --jq .sha)"
+          if [[ "$tagged_commit" != "$COMMIT" ]]; then
+            echo "::error::Tag $TAG no longer points to the verified build commit."
+            exit 1
+          fi
+          cd dist
+          sha256sum --strict --check SHA256SUMS
+          flags=()
+          if [[ "$TAG" == *-* ]]; then
+            flags+=(--prerelease --latest=false)
+          fi
+          gh release create "$TAG" ./*.tar.gz ./*.deb SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --notes-file release-notes.md --title "$TAG" "${flags[@]}"
 
       - name: Create draft GitHub release
+        if: github.repository != 'valargroup/zecd'
         uses: softprops/action-gh-release@v2
         with:
           draft: true
@@ -173,7 +263,7 @@ jobs:
   # `cargo install` and a caret requirement both skip a prerelease unless asked for by version.
   crates-io:
     needs: [setup, release]
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' && github.repository != 'valargroup/zecd'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -216,99 +306,3 @@ jobs:
             exit 0
           fi
           cargo publish --locked
-
-  # amd64: the reproducible StageX image, pushed *by digest* (no tags of its own). The
-  # `manifest` job stitches amd64 + arm64 into one multi-arch tag, so consumers pull a single
-  # `ghcr.io/.../zecd:<version>` and Docker picks the right arch. rewrite-timestamp + forced
-  # compression keep the pushed layers deterministic; SBOM/provenance ride along on the digest.
-  docker:
-    needs: setup
-    # Always on a tag push; on manual dispatch only when push_images was requested.
-    if: github.event_name == 'push' || inputs.push_images
-    runs-on: ubuntu-latest
-    outputs:
-      digest: ${{ steps.build.outputs.digest }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: docker/setup-buildx-action@v3
-
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - uses: docker/build-push-action@v6
-        id: build
-        with:
-          context: .
-          sbom: true
-          provenance: mode=max
-          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true,rewrite-timestamp=true,force-compression=true
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-  # arm64: the static-musl Alpine image (Dockerfile.arm64), built natively on a GitHub arm64
-  # runner and pushed by digest. StageX publishes no arm64 images yet, so this isn't
-  # full-source-bootstrapped like amd64 - but it is bit-for-bit reproducible (pinned base + apk
-  # toolchain).
-  docker-arm64:
-    needs: setup
-    # Always on a tag push; on manual dispatch only when push_images was requested.
-    if: github.event_name == 'push' || inputs.push_images
-    runs-on: ubuntu-24.04-arm
-    outputs:
-      digest: ${{ steps.build.outputs.digest }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: docker/setup-buildx-action@v3
-
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - uses: docker/build-push-action@v6
-        id: build
-        with:
-          context: .
-          file: Dockerfile.arm64
-          platforms: linux/arm64
-          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=arm64
-          cache-to: type=gha,mode=max,scope=arm64
-
-  # Combine the two arch digests into one multi-arch manifest under the real tags
-  # (<version>, <major>.<minor>, and latest via metadata-action's default) - no -arm64 suffix.
-  manifest:
-    needs: [setup, docker, docker-arm64]
-    if: github.event_name == 'push' || inputs.push_images
-    runs-on: ubuntu-latest
-    steps:
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - uses: docker/metadata-action@v5
-        id: meta
-        with:
-          images: ghcr.io/${{ github.repository }}
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=${{ needs.setup.outputs.version }},enable=${{ github.event_name == 'workflow_dispatch' }}
-
-      - name: Create and push the multi-arch manifest
-        run: |
-          tags=$(jq -r '.tags[] | "-t " + .' <<< '${{ steps.meta.outputs.json }}')
-          docker buildx imagetools create $tags \
-            ghcr.io/${{ github.repository }}@${{ needs.docker.outputs.digest }} \
-            ghcr.io/${{ github.repository }}@${{ needs.docker-arm64.outputs.digest }}
-
-      - name: Show the resulting manifest
-        run: docker buildx imagetools inspect ghcr.io/${{ github.repository }}:${{ needs.setup.outputs.version }}

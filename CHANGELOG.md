@@ -7,6 +7,18 @@ project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-11-26
+
+First Valargroup release of zecd, with mining-pool support for Zebra and Zakura.
+One authenticated endpoint serves block templates, block submission, reward
+tracking and wallet payouts. Linux amd64 and arm64 releases include statically
+linked binaries and Debian packages.
+
+Before mining on Mainnet, use a pool block builder that sets the coinbase expiry
+height to the block height. Payouts need enough funds to cover the ZIP 317 fee.
+See the [mining pool setup guide](https://github.com/valargroup/zecd/blob/v0.11.0/docs/OPERATIONS.md#mining-pools)
+for client-specific settings and limits.
+
 ### Added
 - **Mining RPC forwarding on a full-node backend.** On a zebra backend, `getblocktemplate`,
   `submitblock`, `getblock`, `getblocksubsidy`, `getmininginfo`, `getdifficulty`,
@@ -1482,6 +1494,7 @@ Zcash, backed entirely by librustzcash and running as a light client.
 ### Security
 - Pre-release audit hardening; refuse to start on mainnet with the placeholder RPC password; enforce a 12-character passphrase minimum.
 
+[0.11.0]: https://github.com/valargroup/zecd/releases/tag/v0.11.0
 [0.10.0]: https://github.com/zecrocks/zecd/compare/v0.9.0...v0.10.0
 [0.10.0-rc1]: https://github.com/zecrocks/zecd/compare/v0.9.0...v0.10.0-rc1
 [0.9.0]: https://github.com/zecrocks/zecd/compare/v0.8.2...v0.9.0
